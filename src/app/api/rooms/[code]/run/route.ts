@@ -1,47 +1,31 @@
 import { NextRequest, NextResponse } from "next/server";
 import { performance } from "node:perf_hooks";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import { serverDb } from "@/lib/supabase";
 import type {
   ComparisonResult,
 } from "@/lib/comparison-types";
+import { authenticateRoom } from "@/lib/security/auth";
+import { checkRunQuota } from "@/lib/security/rate-limit";
+import { limits } from "@/lib/security/config";
+import { validSnapshot, snapshotHash, validComparisonResult, type Snapshot } from "@/lib/security/validation";
+import { claimRun, releaseRunClaim } from "@/lib/security/run-claims";
+import { notifyRunCompleted } from "@/lib/security/broadcast";
 
 type Context = {
   params: Promise<{ code: string }>;
 };
 
-type Snapshot = {
-  prompt_a: string;
-  prompt_b: string;
-  system_prompt: string;
-  test_input: string;
-  temperature: number;
-};
-
-const LIMIT = 12000;
-
-function validSnapshot(value: unknown): value is Snapshot {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    return false;
-  }
-
-  const v = value as Record<string, unknown>;
-
-  const textFields = [
-    "prompt_a", "prompt_b", "system_prompt", "test_input",
-  ];
-
-  return (
-    textFields.every(
-      (field) =>
-        typeof v[field] === "string" &&
-        (v[field] as string).length <= LIMIT
-    ) &&
-    typeof v.temperature === "number" &&
-    Number.isFinite(v.temperature) &&
-    v.temperature >= 0 &&
-    v.temperature <= 2 &&
-    (v.test_input as string).trim().length > 0
-  );
+function geminiFailed(model: string, latencyMs: number): ComparisonResult {
+  return {
+    text: "",
+    latencyMs: Math.round(latencyMs),
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    model,
+    error: "Gemini request failed. Check server logs and model access.",
+  };
 }
 
 async function executeVariant(
@@ -91,13 +75,12 @@ async function executeVariant(
       }
     );
 
-    const json = await response.json();
-
     if (!response.ok) {
-      const message =
-        json.error?.message || `Gemini HTTP ${response.status}`;
-      throw new Error(String(message).slice(0, 300));
+      await response.body?.cancel();
+      throw new Error(`Gemini HTTP ${response.status}`);
     }
+
+    const json = await response.json();
 
     const output = (
       json.candidates?.[0]?.content?.parts || []
@@ -108,7 +91,7 @@ async function executeVariant(
 
     const usage = json.usageMetadata || {};
 
-    return {
+    const result: ComparisonResult = {
       text: output || "(No text returned by the model)",
       latencyMs: Math.round(performance.now() - started),
       inputTokens: usage.promptTokenCount ?? 0,
@@ -116,25 +99,31 @@ async function executeVariant(
       totalTokens: usage.totalTokenCount ?? 0,
       model,
     };
+
+    if (!validComparisonResult(result)) {
+      throw new Error("Gemini returned an unexpected result shape");
+    }
+
+    return result;
   } catch (error) {
     console.error("Gemini execution failed:", {
       model,
       error: error instanceof Error ? error.message : "Unknown error",
     });
 
-    return {
-      text: "",
-      latencyMs: Math.round(performance.now() - started),
-      inputTokens: 0,
-      outputTokens: 0,
-      totalTokens: 0,
-      model,
-      error: error instanceof Error
-        ? error.name === "AbortError"
-          ? "Gemini request timed out"
-          : "Gemini request failed. Check server logs and model access."
-        : "Unknown execution error",
-    };
+    if (error instanceof Error && error.name === "AbortError") {
+      return {
+        text: "",
+        latencyMs: Math.round(performance.now() - started),
+        inputTokens: 0,
+        outputTokens: 0,
+        totalTokens: 0,
+        model,
+        error: "Gemini request timed out",
+      };
+    }
+
+    return geminiFailed(model, performance.now() - started);
   } finally {
     clearTimeout(timer);
   }
@@ -170,9 +159,34 @@ export async function POST(
     );
   }
 
+  let db: SupabaseClient;
+
+  try {
+    db = serverDb();
+
+    const auth = await authenticateRoom(db, code, request);
+
+    if (!auth.ok) return auth.response;
+
+    const allowed = await checkRunQuota(db, code);
+
+    if (!allowed) {
+      return NextResponse.json(
+        { error: "Comparison quota reached for now. Try again later." },
+        { status: 429 }
+      );
+    }
+  } catch (error) {
+    console.error("Comparison setup failed:", error);
+    return NextResponse.json(
+      { error: "Database error" },
+      { status: 500 }
+    );
+  }
+
   const raw = await request.text();
 
-  if (raw.length > 50000) {
+  if (raw.length > limits.bodyMaxChars) {
     return NextResponse.json(
       { error: "Request too large" },
       { status: 413 }
@@ -197,44 +211,76 @@ export async function POST(
     );
   }
 
+  const snapshotValue = snapshot as Snapshot;
+  const hash = snapshotHash(snapshotValue);
+
+  let claimedAt: string | null = null;
+  let runId: string | null = null;
+
   try {
-    const db = serverDb();
+    const claim = await claimRun(db, code, limits.runClaimTtlSeconds);
 
-    const { data: existing, error: readError } = await db
-      .from("studio_rooms")
-      .select("code")
-      .eq("code", code)
-      .maybeSingle();
-
-    if (readError) throw readError;
-
-    if (!existing) {
+    if (!claim.claimed) {
       return NextResponse.json(
-        { error: "Room not found" },
-        { status: 404 }
+        { error: "A comparison is already running in this room" },
+        { status: 409 }
       );
     }
 
+    claimedAt = claim.claimedAt;
+
+    const { data: runRow, error: runError } = await db
+      .from("room_runs")
+      .insert({
+        room_code: code,
+        snapshot_hash: hash,
+        model,
+        temperature: snapshotValue.temperature,
+        status: "running",
+      })
+      .select("id")
+      .single();
+
+    if (runError) throw runError;
+
+    runId = runRow.id;
+
     const [result_a, result_b] = await Promise.all([
       executeVariant(
-        snapshot.system_prompt,
-        snapshot.prompt_a,
-        snapshot.test_input,
-        snapshot.temperature,
+        snapshotValue.system_prompt,
+        snapshotValue.prompt_a,
+        snapshotValue.test_input,
+        snapshotValue.temperature,
         model,
         apiKey
       ),
       executeVariant(
-        snapshot.system_prompt,
-        snapshot.prompt_b,
-        snapshot.test_input,
-        snapshot.temperature,
+        snapshotValue.system_prompt,
+        snapshotValue.prompt_b,
+        snapshotValue.test_input,
+        snapshotValue.temperature,
         model,
         apiKey
       ),
     ]);
 
     const executedAt = new Date().toISOString();
+
+    if (!validComparisonResult(result_a) || !validComparisonResult(result_b)) {
+      throw new Error("Comparison results failed validation");
+    }
+
+    const { error: recordError } = await db
+      .from("room_runs")
+      .update({
+        result_a,
+        result_b,
+        status: "completed",
+        executed_at: executedAt,
+      })
+      .eq("id", runId);
+
+    if (recordError) throw recordError;
 
     const { error: saveError } = await db
       .from("studio_rooms")
@@ -247,12 +293,28 @@ export async function POST(
 
     if (saveError) throw saveError;
 
+    await releaseRunClaim(db, code, claimedAt);
+    claimedAt = null;
+
+    void notifyRunCompleted(db, code);
+
     return NextResponse.json(
-      { result_a, result_b, executedAt },
+      { result_a, result_b, executedAt, runId, snapshotHash: hash },
       { headers: { "Cache-Control": "no-store" } }
     );
   } catch (error) {
     console.error("Comparison endpoint:", error);
+
+    if (runId) {
+      await db
+        .from("room_runs")
+        .update({ status: "failed", error: "Run failed" })
+        .eq("id", runId);
+    }
+
+    if (claimedAt) {
+      await releaseRunClaim(db, code, claimedAt);
+    }
 
     return NextResponse.json(
       { error: "Unable to complete comparison" },

@@ -31,7 +31,9 @@ export default function Home() {
         throw new Error(result.error || "Unable to create room");
       }
 
-      router.push(`/room/${result.room.code}`);
+      router.push(
+        `/room/${result.room.code}#access_token=${result.accessToken}`
+      );
     } catch (err) {
       setError(
         err instanceof Error ? err.message : "Unknown error"

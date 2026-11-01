@@ -11,8 +11,24 @@ import {
 } from "lucide-react";
 import { createBrowserClient } from "@/lib/supabase-browser";
 import type {
-  EditableField, RoomEdit, StudioRoom,
+  EditableField, RoomEdit, RoomRun, StudioRoom,
 } from "@/lib/room-types";
+
+function loadAccessToken(code: string): string | null {
+  if (typeof window === "undefined") return null;
+
+  const match = window.location.hash.match(
+    /access_token=([A-Za-z0-9_-]+)/
+  );
+
+  if (match) {
+    sessionStorage.setItem(`coprompt-token-${code}`, match[1]);
+    window.history.replaceState(null, "", window.location.pathname);
+    return match[1];
+  }
+
+  return sessionStorage.getItem(`coprompt-token-${code}`);
+}
 
 type SaveState = "saved" | "saving" | "error";
 
@@ -26,7 +42,9 @@ export default function Studio({ code }: { code: string }) {
   const [typing, setTyping] = useState("");
   const [copied, setCopied] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>("saved");
-
+  const [accessToken, setAccessToken] = useState<string | null>(null);
+  const [needsInvite, setNeedsInvite] = useState(false);
+  const [latestRun, setLatestRun] = useState<RoomRun | null>(null);
   const client = useRef<ReturnType<typeof createBrowserClient> | null>(null);
   const channel = useRef<RealtimeChannel | null>(null);
   const identity = useRef("");
@@ -37,55 +55,80 @@ export default function Studio({ code }: { code: string }) {
   const latest = useRef<StudioRoom | null>(null);
 
   const loadRoom = useCallback(async () => {
-    try {
-      const response = await fetch(`/api/rooms/${code}`, {
-        cache: "no-store",
-      });
+    const token = accessToken ?? loadAccessToken(code);
 
-      const json = await response.json();
+    if (token) {
+      try {
+        const response = await fetch(`/api/rooms/${code}`, {
+          cache: "no-store",
+          headers: { Authorization: `Bearer ${token}` },
+        });
 
-      if (!response.ok) {
-        throw new Error(json.error || "Room unavailable");
+        const json = await response.json();
+
+        if (!response.ok) {
+          if (response.status === 401) setNeedsInvite(true);
+          throw new Error(json.error || "Room unavailable");
+        }
+
+        latest.current = json.room as StudioRoom;
+        setRoom(json.room as StudioRoom);
+        setLatestRun((json.latestRun as RoomRun | null) ?? null);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Unable to load room");
       }
-
-      latest.current = json.room as StudioRoom;
-      setRoom(json.room as StudioRoom);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Unable to load room");
-    } finally {
-      setLoading(false);
+    } else {
+      setNeedsInvite(true);
     }
-  }, [code]);
+
+    setLoading(false);
+  }, [code, accessToken]);
 
   useEffect(() => {
     let active = true;
 
-    fetch(`/api/rooms/${code}`, { cache: "no-store" })
-      .then(async (response) => {
+    const token = loadAccessToken(code);
+
+    void (async () => {
+      if (!token) {
+        if (!active) return;
+        setNeedsInvite(true);
+        setLoading(false);
+        return;
+      }
+
+      if (!active) return;
+
+      setAccessToken(token);
+
+      try {
+        const response = await fetch(`/api/rooms/${code}`, {
+          cache: "no-store",
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
         const json = await response.json();
 
+        if (!active) return;
+
         if (!response.ok) {
+          if (response.status === 401) setNeedsInvite(true);
           throw new Error(json.error || "Room unavailable");
         }
 
-        return json.room as StudioRoom;
-      })
-      .then((data) => {
-        if (!active) return;
-
-        latest.current = data;
-        setRoom(data);
-      })
-      .catch((err: unknown) => {
+        latest.current = json.room as StudioRoom;
+        setRoom(json.room as StudioRoom);
+        setLatestRun((json.latestRun as RoomRun | null) ?? null);
+      } catch (err: unknown) {
         if (!active) return;
 
         setError(
           err instanceof Error ? err.message : "Unable to load room"
         );
-      })
-      .finally(() => {
+      } finally {
         if (active) setLoading(false);
-      });
+      }
+    })();
 
     return () => {
       active = false;
@@ -93,7 +136,7 @@ export default function Studio({ code }: { code: string }) {
   }, [code]);
 
   useEffect(() => {
-    if (!/^[0-9]{4}$/.test(code)) return;
+    if (!accessToken) return;
 
     const supabase = createBrowserClient();
     client.current = supabase;
@@ -101,10 +144,29 @@ export default function Studio({ code }: { code: string }) {
     const me = `Guest-${crypto.randomUUID().slice(0, 6)}`;
     identity.current = me;
 
-    // Public channel for a controlled hackathon demo only.
+    void (async () => {
+      try {
+        await supabase.auth.signInAnonymously();
+      } catch {
+        console.error("Anonymous sign-in unavailable");
+      }
+
+      const session = (await supabase.auth.getSession()).data.session;
+
+      await fetch(`/api/rooms/${code}/join`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          ...(session?.access_token
+            ? { "x-supabase-auth": session.access_token }
+            : {}),
+        },
+      });
+    })();
+
     const roomChannel = supabase.channel(`coprompt-room-${code}`, {
       config: {
-        private: false,
+        private: true,
         presence: { key: me },
       },
     });
@@ -132,22 +194,9 @@ export default function Studio({ code }: { code: string }) {
 
     roomChannel.on(
       "broadcast",
-      { event: "comparison-results" },
-      ({ payload }) => {
-        const results = payload as ComparisonResponse;
-
-        setRoom((current) => {
-          if (!current) return current;
-
-          const next = {
-            ...current,
-            result_a: results.result_a,
-            result_b: results.result_b,
-          };
-
-          latest.current = next;
-          return next;
-        });
+      { event: "results-updated" },
+      () => {
+        void loadRoom();
       }
     );
 
@@ -185,7 +234,7 @@ export default function Studio({ code }: { code: string }) {
       client.current = null;
       void supabase.removeChannel(roomChannel);
     };
-  }, [code, loadRoom]);
+  }, [code, accessToken, loadRoom]);
 
   useEffect(() => {
     const activeTimers = timers.current;
@@ -200,11 +249,31 @@ export default function Studio({ code }: { code: string }) {
     try {
       const response = await fetch(`/api/rooms/${code}`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ [field]: value }),
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({
+          [field]: value,
+          expected_updated_at: latest.current?.updated_at,
+        }),
       });
 
       if (!response.ok) {
+        if (response.status === 409) {
+          setError(
+            "Someone else changed the room. Your copy was refreshed — re-apply your edit if it is missing."
+          );
+          void loadRoom();
+          setSaveState("error");
+          return;
+        }
+
+        if (response.status === 401) {
+          setNeedsInvite(true);
+          return;
+        }
+
         throw new Error(`Unable to save ${field}`);
       }
 
@@ -277,7 +346,10 @@ export default function Studio({ code }: { code: string }) {
 
       const response = await fetch(`/api/rooms/${code}/run`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
         body: JSON.stringify(payload),
       });
 
@@ -301,11 +373,7 @@ export default function Studio({ code }: { code: string }) {
         return next;
       });
 
-      await channel.current?.send({
-        type: "broadcast",
-        event: "comparison-results",
-        payload: results,
-      });
+      void loadRoom();
     } catch (e) {
       setError(
         e instanceof Error ? e.message : "Unable to run comparison"
@@ -316,8 +384,11 @@ export default function Studio({ code }: { code: string }) {
   }
 
   async function copyLink() {
+    if (!accessToken) return;
+
     try {
-      await navigator.clipboard.writeText(window.location.href);
+      const invite = `${window.location.origin}/room/${code}#access_token=${accessToken}`;
+      await navigator.clipboard.writeText(invite);
       setCopied(true);
       setTimeout(() => setCopied(false), 1800);
     } catch {
@@ -330,6 +401,21 @@ export default function Studio({ code }: { code: string }) {
       <main className="flex min-h-screen items-center justify-center gap-3 bg-[#080b16] text-white">
         <LoaderCircle className="animate-spin text-violet-400" />
         Loading collaboration room...
+      </main>
+    );
+  }
+
+  if (needsInvite && !room) {
+    return (
+      <main className="min-h-screen bg-[#080b16] p-10 text-white">
+        <h1 className="text-2xl font-bold">Invite required</h1>
+        <p className="mt-3 max-w-md text-slate-400">
+          This room is private. Open it from an invite link that
+          includes an access token, or ask the host to share one.
+        </p>
+        <Link href="/" className="mt-6 inline-block text-violet-400">
+          Return to home
+        </Link>
       </main>
     );
   }
@@ -500,6 +586,14 @@ export default function Studio({ code }: { code: string }) {
             correctness. Token usage and latency are measured separately
             for each model request.
           </p>
+
+          {latestRun && (
+            <p className="mt-1 text-xs text-slate-500">
+              Latest run: {latestRun.model} · snapshot{" "}
+              {latestRun.snapshot_hash.slice(0, 8)} ·{" "}
+              {new Date(latestRun.executed_at).toLocaleString()}
+            </p>
+          )}
         </section>
       </div>
     </main>
