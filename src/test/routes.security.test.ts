@@ -11,19 +11,36 @@ import { hashAccessToken } from "@/lib/security/tokens";
 import { GET, PATCH } from "@/app/api/rooms/[code]/route";
 import { POST as runPOST } from "@/app/api/rooms/[code]/run/route";
 import { POST as joinPOST } from "@/app/api/rooms/[code]/join/route";
+import { POST as claimPOST } from "@/app/api/rooms/[code]/claim/route";
 
 type Result = { data: unknown; error: unknown };
 
 const TOKEN = "test-access-token";
 const HASH = hashAccessToken(TOKEN);
 
-const authRoom = { data: { code: "1234", access_token_hash: HASH }, error: null };
+const authRoom = {
+  data: {
+    code: "1234",
+    access_token_hash: HASH,
+    access_token_issued_at: new Date().toISOString(),
+  },
+  error: null,
+};
+
+const legacyRoom = {
+  data: {
+    code: "6878",
+    access_token_hash: null,
+    access_token_issued_at: null,
+  },
+  error: null,
+};
 
 function builder(result: Result) {
   const b: Record<string, unknown> = {};
 
   for (const method of [
-    "select", "eq", "neq", "or", "order", "limit",
+    "select", "eq", "neq", "is", "or", "order", "limit",
     "update", "insert", "upsert", "single", "maybeSingle", "returns",
   ]) {
     b[method] = vi.fn().mockReturnValue(b);
@@ -332,7 +349,113 @@ describe("run", () => {
   });
 });
 
+describe("legacy rooms and token expiry", () => {
+  it("locks an unclaimed legacy room out of GET regardless of token", async () => {
+    vi.mocked(serverDb).mockReturnValue(
+      fakeDb({ studio_rooms: [legacyRoom, legacyRoom] })
+    );
+
+    const noToken = await GET(
+      request("http://localhost/api/rooms/6878", { token: null }),
+      ctx
+    );
+
+    const withToken = await GET(
+      request("http://localhost/api/rooms/6878"),
+      ctx
+    );
+
+    expect(noToken.status).toBe(401);
+    expect(withToken.status).toBe(401);
+    expect((await withToken.json()).error).toMatch(/not been claimed/);
+  });
+
+  it("returns 404 for a room that does not exist", async () => {
+    vi.mocked(serverDb).mockReturnValue(
+      fakeDb({ studio_rooms: [{ data: null, error: null }] })
+    );
+
+    const response = await GET(
+      request("http://localhost/api/rooms/9999"),
+      ctx
+    );
+
+    expect(response.status).toBe(404);
+  });
+
+  it("rejects an expired token when a TTL is configured", async () => {
+    process.env.ACCESS_TOKEN_TTL_SECONDS = "5";
+
+    vi.mocked(serverDb).mockReturnValue(
+      fakeDb({
+        studio_rooms: [
+          {
+            data: {
+              code: "1234",
+              access_token_hash: HASH,
+              access_token_issued_at: new Date(
+                Date.now() - 10 * 60 * 1000
+              ).toISOString(),
+            },
+            error: null,
+          },
+        ],
+      })
+    );
+
+    const response = await GET(
+      request("http://localhost/api/rooms/1234"),
+      ctx
+    );
+
+    delete process.env.ACCESS_TOKEN_TTL_SECONDS;
+
+    expect(response.status).toBe(401);
+    expect((await response.json()).error).toMatch(/expired/);
+  });
+
+  it("accepts the same token when no TTL is configured", async () => {
+    vi.mocked(serverDb).mockReturnValue(
+      fakeDb({
+        studio_rooms: [
+          authRoom,
+          {
+            data: { code: "1234", updated_at: "2026-01-01T00:00:00Z" },
+            error: null,
+          },
+        ],
+      })
+    );
+
+    const response = await GET(
+      request("http://localhost/api/rooms/1234"),
+      ctx
+    );
+
+    expect(response.status).toBe(200);
+  });
+});
+
 describe("join", () => {
+  it("returns 401 when the client session cannot be verified", async () => {
+    const db = fakeDb({ studio_rooms: [authRoom] });
+    vi.mocked(db.auth.getUser as ReturnType<typeof vi.fn>).mockResolvedValue({
+      data: { user: null },
+      error: { message: "bad jwt" },
+    });
+    vi.mocked(serverDb).mockReturnValue(db);
+
+    const response = await joinPOST(
+      request("http://localhost/api/rooms/1234/join", {
+        method: "POST",
+        headers: { "x-supabase-auth": "forged-jwt" },
+      }),
+      ctx
+    );
+
+    expect(response.status).toBe(401);
+  });
+
   it("returns 401 without a room token", async () => {
     vi.mocked(serverDb).mockReturnValue(fakeDb({}));
 
@@ -375,5 +498,82 @@ describe("join", () => {
 
     expect(response.status).toBe(200);
     expect(db.from).toHaveBeenCalledWith("room_memberships");
+  });
+});
+
+describe("legacy room claim", () => {
+  it("claims an unclaimed room once and issues a token", async () => {
+    const db = fakeDb({
+      studio_rooms: [
+        legacyRoom,
+        { data: ["6878"], error: null },
+      ],
+    });
+    vi.mocked(serverDb).mockReturnValue(db);
+
+    const response = await claimPOST(
+      request("http://localhost/api/rooms/6878/claim", {
+        method: "POST",
+      }),
+      ctx
+    );
+
+    expect(response.status).toBe(201);
+    const json = await response.json();
+    expect(json.accessToken).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+    expect(db.from).toHaveBeenCalledWith("room_memberships");
+  });
+
+  it("refuses to re-claim an already claimed room", async () => {
+    vi.mocked(serverDb).mockReturnValue(
+      fakeDb({ studio_rooms: [authRoom] })
+    );
+
+    const response = await claimPOST(
+      request("http://localhost/api/rooms/1234/claim", {
+        method: "POST",
+      }),
+      ctx
+    );
+
+    expect(response.status).toBe(409);
+  });
+
+  it("loses the race when another claim wins", async () => {
+    vi.mocked(serverDb).mockReturnValue(
+      fakeDb({
+        studio_rooms: [
+          legacyRoom,
+          { data: [], error: null },
+        ],
+      })
+    );
+
+    const response = await claimPOST(
+      request("http://localhost/api/rooms/6878/claim", {
+        method: "POST",
+      }),
+      ctx
+    );
+
+    expect(response.status).toBe(409);
+  });
+
+  it("rate limits claim attempts", async () => {
+    const db = fakeDb({});
+    vi.mocked(db.rpc as ReturnType<typeof vi.fn>).mockResolvedValue({
+      data: false,
+      error: null,
+    });
+    vi.mocked(serverDb).mockReturnValue(db);
+
+    const response = await claimPOST(
+      request("http://localhost/api/rooms/6878/claim", {
+        method: "POST",
+      }),
+      ctx
+    );
+
+    expect(response.status).toBe(429);
   });
 });

@@ -44,6 +44,7 @@ export default function Studio({ code }: { code: string }) {
   const [saveState, setSaveState] = useState<SaveState>("saved");
   const [accessToken, setAccessToken] = useState<string | null>(null);
   const [needsInvite, setNeedsInvite] = useState(false);
+  const [claiming, setClaiming] = useState(false);
   const [latestRun, setLatestRun] = useState<RoomRun | null>(null);
   const client = useRef<ReturnType<typeof createBrowserClient> | null>(null);
   const channel = useRef<RealtimeChannel | null>(null);
@@ -166,7 +167,7 @@ export default function Studio({ code }: { code: string }) {
 
     const roomChannel = supabase.channel(`coprompt-room-${code}`, {
       config: {
-        private: true,
+        private: false,
         presence: { key: me },
       },
     });
@@ -405,6 +406,28 @@ export default function Studio({ code }: { code: string }) {
     );
   }
 
+  async function claimRoom() {
+    setClaiming(true);
+
+    try {
+      const response = await fetch(`/api/rooms/${code}/claim`, {
+        method: "POST",
+      });
+
+      const json = await response.json();
+
+      if (!response.ok) {
+        throw new Error(json.error || "Unable to claim room");
+      }
+
+      sessionStorage.setItem(`coprompt-token-${code}`, json.accessToken);
+      window.location.reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unable to claim room");
+      setClaiming(false);
+    }
+  }
+
   if (needsInvite && !room) {
     return (
       <main className="min-h-screen bg-[#080b16] p-10 text-white">
@@ -413,7 +436,14 @@ export default function Studio({ code }: { code: string }) {
           This room is private. Open it from an invite link that
           includes an access token, or ask the host to share one.
         </p>
-        <Link href="/" className="mt-6 inline-block text-violet-400">
+        <button
+          onClick={claimRoom}
+          disabled={claiming}
+          className="mt-6 rounded-xl border border-violet-500 px-5 py-3 text-sm font-semibold text-violet-300 hover:bg-violet-500/10 disabled:opacity-50"
+        >
+          {claiming ? "Claiming..." : "I own this room — claim it"}
+        </button>
+        <Link href="/" className="mt-6 block text-violet-400">
           Return to home
         </Link>
       </main>

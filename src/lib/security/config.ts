@@ -25,3 +25,7 @@ export const limits = {
   runClaimTtlSeconds: num("RUN_CLAIM_TTL_SECONDS", 90),
   bodyMaxChars: 50000,
 };
+
+export function accessTokenTtlSeconds(): number {
+  return num("ACCESS_TOKEN_TTL_SECONDS", 0);
+}

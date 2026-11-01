@@ -6,9 +6,15 @@
 
 alter table public.studio_rooms
   add column if not exists access_token_hash text,
+  add column if not exists access_token_issued_at timestamptz,
   add column if not exists owner_member_id uuid,
   add column if not exists run_status text not null default 'idle',
   add column if not exists run_claimed_at timestamptz;
+
+-- Legacy rooms (created before this migration, e.g. test room 6878) have a
+-- null access_token_hash. Their data is untouched; a room stays locked until
+-- its owner claims it once via POST /api/rooms/[code]/claim, which issues a
+-- token and binds it atomically (guarded by access_token_hash is null).
 
 -- 2. Memberships: an anon-auth JWT linked to a room via a valid invite token
 
@@ -121,6 +127,8 @@ grant execute on function public.consume_rate_limit(text, integer, integer)
 -- 6. Realtime authorization for private room channels -----------------------
 -- Clients sign in anonymously; the join endpoint links their auth_user_id to
 -- the room only after the invite token is verified server-side.
+-- NOTE: apply this migration and run security-hardening-verification.sql
+-- BEFORE switching the client channels to private: true.
 
 create policy "room members can subscribe"
 on realtime.messages

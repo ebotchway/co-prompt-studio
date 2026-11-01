@@ -1,6 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { NextRequest, NextResponse } from "next/server";
 import { verifyAccessToken } from "./tokens";
+import { accessTokenTtlSeconds } from "./config";
 
 export type RoomAuth =
   | { ok: true }
@@ -25,6 +26,16 @@ function unauthorized(message: string): NextResponse {
   );
 }
 
+function tokenExpired(issuedAt: string | null): boolean {
+  const ttl = accessTokenTtlSeconds();
+
+  if (ttl === 0 || !issuedAt) {
+    return false;
+  }
+
+  return Date.now() - Date.parse(issuedAt) > ttl * 1000;
+}
+
 export async function authenticateRoom(
   db: SupabaseClient,
   code: string,
@@ -42,15 +53,37 @@ export async function authenticateRoom(
   try {
     const { data: room, error } = await db
       .from("studio_rooms")
-      .select("code, access_token_hash")
+      .select(
+        "code, access_token_hash, access_token_issued_at"
+      )
       .eq("code", code)
       .maybeSingle();
 
     if (error) throw error;
 
+    if (!room) {
+      return {
+        ok: false,
+        response: NextResponse.json(
+          { error: "Room not found" },
+          { status: 404, headers: { "Cache-Control": "no-store" } }
+        ),
+      };
+    }
+
+    if (!room.access_token_hash) {
+      return {
+        ok: false,
+        response: unauthorized(
+          "This room has not been claimed by its owner yet"
+        ),
+      };
+    }
+
     if (
-      !room?.access_token_hash ||
-      !verifyAccessToken(token, room.access_token_hash)
+      !token ||
+      !verifyAccessToken(token, room.access_token_hash) ||
+      tokenExpired(room.access_token_issued_at)
     ) {
       return {
         ok: false,
