@@ -253,6 +253,107 @@ check(
   `status ${revokedGet.status}`
 );
 
+// Open-socket continuation: while A's channel was already subscribed, the
+// server only re-authorizes on a fresh token. Measure whether A still
+// receives while the socket is open (this is the residual exposure window).
+if (statusA1 === "SUBSCRIBED") {
+  const postRevocation = [];
+
+  chA1.on("broadcast", { event: "staging-probe" }, ({ payload }) =>
+    postRevocation.push(payload)
+  );
+
+  await chA1.send({
+    type: "broadcast",
+    event: "staging-probe",
+    payload: { post: 1 },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+
+  console.log(
+    `INFO  revoked member's open socket received ${postRevocation.length} event(s) after revocation — residual window until next token refresh`
+  );
+
+  // Fresh token (what autoRefreshToken does) must close the channel.
+  const { data: refreshedA } = await memberA.auth.refreshSession();
+
+  if (refreshedA?.session?.access_token) {
+    await memberA.realtime.setAuth(refreshedA.session.access_token);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    const refreshed = [];
+
+    chA1.on("broadcast", { event: "staging-probe" }, ({ payload }) =>
+      refreshed.push(payload)
+    );
+
+    await chB1.send({
+      type: "broadcast",
+      event: "staging-probe",
+      payload: { post: 2 },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    check(
+      "fresh-token reauthorization closes revoked member's open channel",
+      chA1.state === "closed" &&
+        !refreshed.some((p) => p?.post === 2),
+      `channel state ${chA1.state}, ${refreshed.length} events after refresh`
+    );
+  }
+}
+
+// Public-channel bypass: an outsider must not read or write room messages
+// by joining the same topic with private: false.
+const publicChannel = outsider.channel(`coprompt-room-${room1.code}`, {
+  config: { private: false, presence: { key: "outsider-public" } },
+});
+
+const publicStatus = await subscribe(publicChannel);
+
+const publicReceived = [];
+
+publicChannel.on("broadcast", { event: "staging-probe" }, ({ payload }) =>
+  publicReceived.push(payload)
+);
+
+let bypassReceived = false;
+const bypassTap = ({ payload }) => {
+  if (payload?.bypass) bypassReceived = true;
+};
+
+chB1.on("broadcast", { event: "staging-probe" }, bypassTap);
+
+if (publicStatus === "SUBSCRIBED") {
+  await publicChannel.send({
+    type: "broadcast",
+    event: "staging-probe",
+    payload: { bypass: true },
+  });
+
+  await chB1.send({
+    type: "broadcast",
+    event: "staging-probe",
+    payload: { room: 1 },
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+}
+
+check(
+  "public-channel join on the room topic receives no room messages",
+  !publicReceived.length,
+  `${publicReceived.length} events, subscribe ${publicStatus}`
+);
+
+check(
+  "public-channel publish does not reach room members",
+  !bypassReceived,
+  `subscribe status ${publicStatus}`
+);
+
 // A re-subscribing after revocation must be rejected by RLS.
 if (statusA1 === "SUBSCRIBED") await chA1.unsubscribe();
 await memberA.realtime.setAuth(sessionA.access_token);

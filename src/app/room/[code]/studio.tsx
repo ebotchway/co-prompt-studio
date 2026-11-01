@@ -52,6 +52,7 @@ export default function Studio({ code }: { code: string }) {
     return createBrowserClient();
   }, []);
   const channel = useRef<RealtimeChannel | null>(null);
+  const teardownRef = useRef<(() => void) | null>(null);
   const identity = useRef("");
   const timers = useRef<
     Partial<Record<EditableField, ReturnType<typeof setTimeout>>>
@@ -104,7 +105,13 @@ export default function Studio({ code }: { code: string }) {
         const json = await response.json();
 
         if (!response.ok) {
-          if (response.status === 401) setNeedsInvite(true);
+          if (response.status === 401 || response.status === 403) {
+            setNeedsInvite(true);
+
+            // Revoked members: tear the live channel down immediately
+            // instead of waiting for the next token refresh.
+            if (response.status === 403) teardownRef.current?.();
+          }
           throw new Error(json.error || "Room unavailable");
         }
 
@@ -185,6 +192,63 @@ export default function Studio({ code }: { code: string }) {
     let attempts = 0;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let roomChannel: RealtimeChannel | null = null;
+
+    // Re-authorize the socket on every auth event: refreshed tokens keep
+    // long sessions subscribed, and the token re-check after a membership
+    // revocation closes channels the server no longer authorizes.
+    const { data: authListener } = supabase.auth.onAuthStateChange(
+      (event, session) => {
+        if (
+          !disposed &&
+          (event === "TOKEN_REFRESHED" || event === "SIGNED_IN") &&
+          session?.access_token
+        ) {
+          void supabase.realtime.setAuth(session.access_token);
+        }
+      }
+    );
+
+    const teardownChannel = () => {
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+
+      if (roomChannel) {
+        void supabase.removeChannel(roomChannel);
+        roomChannel = null;
+      }
+
+      if (channel.current) channel.current = null;
+      setConnected(false);
+    };
+
+    teardownRef.current = teardownChannel;
+
+    // Realtime authorizes channels only at join, so a revoked member's
+    // open socket keeps delivering until it is left client-side. Probe
+    // the membership-gated API periodically and close the channel on 403.
+    const membershipProbe = setInterval(() => {
+      if (disposed) return;
+
+      void (async () => {
+        try {
+          const probe = await fetch(`/api/rooms/${code}`, {
+            cache: "no-store",
+            headers: await authHeaders(),
+          });
+
+          if (disposed) return;
+
+          if (probe.status === 401 || probe.status === 403) {
+            teardownChannel();
+            setNeedsInvite(true);
+          }
+        } catch {
+          // Network hiccups are handled by the subscribe retry path.
+        }
+      })();
+    }, 45000);
 
     const subscribeChannel = async () => {
       const session = await ensureSignedIn();
@@ -287,6 +351,23 @@ export default function Studio({ code }: { code: string }) {
             const delay = Math.min(30000, 1000 * 2 ** (attempts - 1));
 
             retryTimer = setTimeout(() => void subscribeChannel(), delay);
+
+            // Repeated failures are usually a lost socket, but they are
+            // also what membership denial looks like. After a few tries,
+            // ask the API instead of retrying forever.
+            if (attempts >= 3) {
+              const probe = await fetch(`/api/rooms/${code}`, {
+                cache: "no-store",
+                headers: await authHeaders(),
+              });
+
+              if (disposed) return;
+
+              if (probe.status === 403 || probe.status === 401) {
+                teardownChannel();
+                setNeedsInvite(true);
+              }
+            }
           }
         }
       });
@@ -299,6 +380,11 @@ export default function Studio({ code }: { code: string }) {
     return () => {
       disposed = true;
 
+      authListener.subscription.unsubscribe();
+
+      clearInterval(membershipProbe);
+      teardownRef.current = null;
+
       if (retryTimer) clearTimeout(retryTimer);
 
       setConnected(false);
@@ -310,7 +396,7 @@ export default function Studio({ code }: { code: string }) {
       channel.current = null;
       client.current = null;
     };
-  }, [code, accessToken, loadRoom, supabase, ensureSignedIn]);
+  }, [code, accessToken, loadRoom, supabase, ensureSignedIn, authHeaders]);
 
   useEffect(() => {
     const activeTimers = timers.current;
