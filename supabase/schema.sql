@@ -22,3 +22,8 @@ alter table public.studio_rooms enable row level security;
 revoke all on public.studio_rooms from anon, authenticated;
 
 -- The trusted service-role API bypasses RLS.
+
+-- Explicit server-only permissions for Supabase Data API
+GRANT SELECT, INSERT, UPDATE, DELETE
+ON TABLE public.studio_rooms
+TO service_role;
