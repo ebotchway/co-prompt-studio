@@ -179,35 +179,57 @@ export default function Studio({ code }: { code: string }) {
     if (!accessToken || !supabase) return;
 
     client.current = supabase;
+    identity.current = `Guest-${crypto.randomUUID().slice(0, 6)}`;
 
-    const me = `Guest-${crypto.randomUUID().slice(0, 6)}`;
-    identity.current = me;
+    let disposed = false;
+    let attempts = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let roomChannel: RealtimeChannel | null = null;
 
-    void (async () => {
+    const subscribeChannel = async () => {
       const session = await ensureSignedIn();
 
-      await fetch(`/api/rooms/${code}/join`, {
+      if (disposed || !session?.access_token) {
+        if (!disposed) {
+          setConnected(false);
+          retryTimer = setTimeout(() => void subscribeChannel(), 2000);
+        }
+        return;
+      }
+
+      const joinResponse = await fetch(`/api/rooms/${code}/join`, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${accessToken}`,
-          ...(session?.access_token
-            ? { "x-supabase-auth": session.access_token }
-            : {}),
+          "x-supabase-auth": session.access_token,
         },
       });
-    })();
 
-    const roomChannel = supabase.channel(`coprompt-room-${code}`, {
-      config: {
-        private: false,
-        presence: { key: me },
-      },
-    });
+      if (disposed) return;
 
-    roomChannel.on(
-      "broadcast",
-      { event: "edit" },
-      ({ payload }) => {
+      if (!joinResponse.ok) {
+        if (joinResponse.status === 401 || joinResponse.status === 403) {
+          setNeedsInvite(true);
+        }
+
+        setConnected(false);
+        return;
+      }
+
+      // Private channels verify a fresh JWT server-side; an expired or
+      // missing session would be rejected at subscribe time.
+      await supabase.realtime.setAuth(session.access_token);
+
+      if (disposed) return;
+
+      roomChannel = supabase.channel(`coprompt-room-${code}`, {
+        config: {
+          private: true,
+          presence: { key: identity.current },
+        },
+      });
+
+      roomChannel.on("broadcast", { event: "edit" }, ({ payload }) => {
         const edit = payload as RoomEdit;
         if (edit.sender === identity.current) return;
 
@@ -222,50 +244,71 @@ export default function Studio({ code }: { code: string }) {
         }
 
         setTyping(`${edit.sender} is editing`);
-      }
-    );
+      });
 
-    roomChannel.on(
-      "broadcast",
-      { event: "results-updated" },
-      () => {
+      roomChannel.on("broadcast", { event: "results-updated" }, () => {
         void loadRoom();
-      }
-    );
+      });
 
-    roomChannel.on(
-      "presence",
-      { event: "sync" },
-      () => {
-        setOnline(Object.keys(roomChannel.presenceState()).length);
-      }
-    );
+      roomChannel.on("presence", { event: "sync" }, () => {
+        setOnline(Object.keys(roomChannel!.presenceState()).length);
+      });
 
-    roomChannel.subscribe(async (status) => {
-      if (status === "SUBSCRIBED") {
-        setConnected(true);
-        await roomChannel.track({
-          name: me,
-          joined_at: new Date().toISOString(),
-        });
+      roomChannel.subscribe(async (status) => {
+        if (disposed) return;
 
-        // Catch updates saved before this browser joined.
-        void loadRoom();
-      } else if (
-        status === "CHANNEL_ERROR" ||
-        status === "TIMED_OUT" ||
-        status === "CLOSED"
-      ) {
-        setConnected(false);
-      }
-    });
+        if (status === "SUBSCRIBED") {
+          attempts = 0;
+          setConnected(true);
 
-    channel.current = roomChannel;
+          await roomChannel?.track({
+            name: identity.current,
+            joined_at: new Date().toISOString(),
+          });
+
+          // Catch updates saved before this browser joined.
+          void loadRoom();
+        } else {
+          setConnected(false);
+
+          if (
+            status === "CHANNEL_ERROR" ||
+            status === "TIMED_OUT" ||
+            status === "CLOSED"
+          ) {
+            if (roomChannel) {
+              void supabase.removeChannel(roomChannel);
+              roomChannel = null;
+              channel.current = null;
+            }
+
+            attempts += 1;
+
+            const delay = Math.min(30000, 1000 * 2 ** (attempts - 1));
+
+            retryTimer = setTimeout(() => void subscribeChannel(), delay);
+          }
+        }
+      });
+
+      channel.current = roomChannel;
+    };
+
+    void subscribeChannel();
 
     return () => {
+      disposed = true;
+
+      if (retryTimer) clearTimeout(retryTimer);
+
+      setConnected(false);
+
+      if (roomChannel) {
+        void supabase.removeChannel(roomChannel);
+      }
+
       channel.current = null;
       client.current = null;
-      void supabase.removeChannel(roomChannel);
     };
   }, [code, accessToken, loadRoom, supabase, ensureSignedIn]);
 
