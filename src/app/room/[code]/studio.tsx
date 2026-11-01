@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { GitCompareArrows, Play } from "lucide-react";
+import type { ComparisonResponse, ComparisonResult } from "@/lib/comparison-types";
 import { RealtimeChannel } from "@supabase/supabase-js";
 import {
   ArrowLeft, BrainCircuit, Check, Copy,
@@ -17,6 +19,7 @@ type SaveState = "saved" | "saving" | "error";
 export default function Studio({ code }: { code: string }) {
   const [room, setRoom] = useState<StudioRoom | null>(null);
   const [loading, setLoading] = useState(true);
+  const [running, setRunning] = useState(false);
   const [error, setError] = useState("");
   const [connected, setConnected] = useState(false);
   const [online, setOnline] = useState(0);
@@ -128,6 +131,27 @@ export default function Studio({ code }: { code: string }) {
     );
 
     roomChannel.on(
+      "broadcast",
+      { event: "comparison-results" },
+      ({ payload }) => {
+        const results = payload as ComparisonResponse;
+
+        setRoom((current) => {
+          if (!current) return current;
+
+          const next = {
+            ...current,
+            result_a: results.result_a,
+            result_b: results.result_b,
+          };
+
+          latest.current = next;
+          return next;
+        });
+      }
+    );
+
+    roomChannel.on(
       "presence",
       { event: "sync" },
       () => {
@@ -231,6 +255,63 @@ export default function Studio({ code }: { code: string }) {
 
       const value = latest.current?.[field];
       if (value !== undefined) void saveField(field, value);
+    }
+  }
+
+  async function runComparison() {
+    const snapshot = latest.current;
+
+    if (!snapshot || running) return;
+
+    setRunning(true);
+    setError("");
+
+    try {
+      const payload = {
+        prompt_a: snapshot.prompt_a,
+        prompt_b: snapshot.prompt_b,
+        system_prompt: snapshot.system_prompt,
+        test_input: snapshot.test_input,
+        temperature: snapshot.temperature,
+      };
+
+      const response = await fetch(`/api/rooms/${code}/run`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      const results = await response.json() as
+        ComparisonResponse & { error?: string };
+
+      if (!response.ok) {
+        throw new Error(results.error || "Comparison failed");
+      }
+
+      setRoom((current) => {
+        if (!current) return current;
+
+        const next = {
+          ...current,
+          result_a: results.result_a,
+          result_b: results.result_b,
+        };
+
+        latest.current = next;
+        return next;
+      });
+
+      await channel.current?.send({
+        type: "broadcast",
+        event: "comparison-results",
+        payload: results,
+      });
+    } catch (e) {
+      setError(
+        e instanceof Error ? e.message : "Unable to run comparison"
+      );
+    } finally {
+      setRunning(false);
     }
   }
 
@@ -344,9 +425,16 @@ export default function Studio({ code }: { code: string }) {
         </section>
 
         <div className="my-6 flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-800 bg-[#12182b] p-5">
-          <p className="text-sm text-slate-400">
-            Model execution will be added in Phase 3.
-          </p>
+          <button
+            onClick={runComparison}
+            disabled={running || !room.test_input.trim()}
+            className="flex items-center gap-3 rounded-xl bg-violet-600 px-6 py-3 font-semibold hover:bg-violet-500 disabled:opacity-50"
+          >
+            {running
+              ? <LoaderCircle className="animate-spin" size={19} />
+              : <Play size={19} />}
+            {running ? "Running comparison..." : "Run Comparison"}
+          </button>
           <label className="flex items-center gap-4 text-sm">
             Temperature: {room.temperature.toFixed(1)}
             <input
@@ -385,6 +473,34 @@ export default function Studio({ code }: { code: string }) {
         <div className="mt-5 text-sm text-violet-300" aria-live="polite">
           {typing}
         </div>
+
+        <section className="mt-10">
+          <div className="mb-5 flex items-center gap-3">
+            <GitCompareArrows className="text-violet-400" />
+            <h2 className="text-2xl font-bold">
+              AI Comparison Results
+            </h2>
+          </div>
+
+          <div className="grid gap-5 lg:grid-cols-2">
+            <ResultPanel
+              title="Variant A"
+              result={room.result_a as ComparisonResult | null}
+              other={room.result_b as ComparisonResult | null}
+            />
+            <ResultPanel
+              title="Variant B"
+              result={room.result_b as ComparisonResult | null}
+              other={room.result_a as ComparisonResult | null}
+            />
+          </div>
+
+          <p className="mt-4 text-xs text-slate-500">
+            Amber highlights show word-position differences, not semantic
+            correctness. Token usage and latency are measured separately
+            for each model request.
+          </p>
+        </section>
       </div>
     </main>
   );
@@ -419,5 +535,69 @@ function Editor({
         {value.length.toLocaleString()} characters
       </p>
     </div>
+  );
+}
+
+
+function ResultPanel({
+  title, result, other,
+}: {
+  title: string;
+  result: ComparisonResult | null;
+  other: ComparisonResult | null;
+}) {
+  const words = result?.text.split(/(\\s+)/) ?? [];
+  const reference = other?.text.split(/(\\s+)/) ?? [];
+
+  return (
+    <article className="min-w-0 rounded-2xl border border-slate-800 bg-[#12182b] p-5">
+      <h3 className="mb-4 font-semibold">{title}</h3>
+
+      {!result ? (
+        <p className="rounded-xl border border-dashed border-slate-700 p-8 text-center text-sm text-slate-500">
+          Run a comparison to see the output.
+        </p>
+      ) : result.error ? (
+        <p className="rounded-xl bg-rose-500/10 p-4 text-sm text-rose-300">
+          {result.error}
+        </p>
+      ) : (
+        <div className="min-h-48 whitespace-pre-wrap break-words rounded-xl bg-[#090d1b] p-4 text-sm leading-7">
+          {words.map((word, index) => (
+            <span
+              key={index}
+              className={
+                word !== reference[index]
+                  ? "rounded bg-amber-500/20 text-amber-200"
+                  : ""
+              }
+            >
+              {word}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {result && (
+        <>
+          <div className="mt-4 grid grid-cols-3 gap-2 text-center text-xs">
+            {[
+              ["Latency", `${result.latencyMs} ms`],
+              ["Input tokens", result.inputTokens],
+              ["Output tokens", result.outputTokens],
+            ].map(([label, value]) => (
+              <div key={label} className="rounded-lg bg-slate-900 p-3">
+                <div className="font-bold">{value}</div>
+                <div className="mt-1 text-slate-400">{label}</div>
+              </div>
+            ))}
+          </div>
+
+          <p className="mt-3 text-xs text-slate-500">
+            Model: {result.model} · Total tokens: {result.totalTokens}
+          </p>
+        </>
+      )}
+    </article>
   );
 }
