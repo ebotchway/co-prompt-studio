@@ -153,6 +153,13 @@ export async function POST(
     );
   }
 
+  if (process.env.GEMINI_RUNS_ENABLED !== "true") {
+    return NextResponse.json(
+      { error: "AI comparisons are temporarily disabled" },
+      { status: 503 }
+    );
+  }
+
   const apiKey = process.env.GEMINI_API_KEY;
   const model = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
 
