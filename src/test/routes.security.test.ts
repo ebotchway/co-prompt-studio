@@ -39,7 +39,7 @@ const legacyRoom = {
 
 const member = { data: { id: "m1", role: "owner" }, error: null };
 
-function builder(result: Result) {
+function builder(result: Result, ops: Array<{ table: string; method: string; payload: unknown }>, table: string) {
   const b: Record<string, unknown> = {};
 
   for (const method of [
@@ -47,6 +47,15 @@ function builder(result: Result) {
     "update", "insert", "upsert", "single", "maybeSingle", "returns",
   ]) {
     b[method] = vi.fn().mockReturnValue(b);
+  }
+
+  for (const method of ["update", "insert", "upsert"]) {
+    const original = b[method] as ReturnType<typeof vi.fn>;
+
+    b[method] = vi.fn((payload: unknown) => {
+      ops.push({ table, method, payload });
+      return original(payload);
+    });
   }
 
   b.then = (
@@ -65,6 +74,8 @@ function fakeDb(
     Object.entries(map).map(([table, results]) => [table, [...results]])
   );
 
+  const ops: Array<{ table: string; method: string; payload: unknown }> = [];
+
   const rpc = vi.fn();
   if (rpcReject) rpc.mockRejectedValue(new Error("counter storage down"));
   else rpc.mockResolvedValue(rpcResult);
@@ -75,9 +86,12 @@ function fakeDb(
         (queues.get(table) as Result[] | undefined)?.shift() ?? {
           data: null,
           error: null,
-        }
+        },
+        ops,
+        table
       )
     ),
+    ops,
     rpc,
     auth: {
       getUser: vi
@@ -458,8 +472,10 @@ describe("run", () => {
 
     const fetchSpy = vi
       .spyOn(global, "fetch")
-      .mockResolvedValue(
-        new Response(JSON.stringify(geminiJson), { status: 200 })
+      .mockImplementation(() =>
+        Promise.resolve(
+          new Response(JSON.stringify(geminiJson), { status: 200 })
+        )
       );
 
     vi.mocked(serverDb).mockReturnValue(
@@ -484,9 +500,45 @@ describe("run", () => {
 
     expect(response.status).toBe(200);
     expect(body.runId).toBe("run-1");
-    expect(body.result_a.text).toBe("model output");
-    expect(body.snapshotHash).toMatch(/^[a-f0-9]{64}$/);
     expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(body.snapshotHash).toMatch(/^[a-f0-9]{64}$/);
+
+    for (const result of [body.result_a, body.result_b]) {
+      expect(result.text).toBe("model output");
+      expect(result).not.toHaveProperty("error");
+      expect(result.model).toMatch(/^gemini/);
+      expect(result.totalTokens).toBe(3);
+    }
+
+    expect(body.result_a).not.toBe(body.result_b);
+
+    const db = vi.mocked(serverDb).mock.results[0].value as unknown as {
+      ops: Array<{ table: string; method: string; payload: Record<string, unknown> }>;
+    };
+
+    const runRecord = db.ops.find(
+      (op) => op.table === "room_runs" && op.method === "update"
+    );
+
+    expect(runRecord).toBeDefined();
+    expect(runRecord?.payload.status).toBe("completed");
+    expect((runRecord?.payload.result_a as { text: string }).text).toBe(
+      "model output"
+    );
+    expect((runRecord?.payload.result_b as { text: string }).text).toBe(
+      "model output"
+    );
+
+    const roomRecord = db.ops.find(
+      (op) =>
+        op.table === "studio_rooms" &&
+        op.method === "update" &&
+        "result_a" in op.payload
+    );
+
+    expect(roomRecord?.payload.result_a).toEqual(body.result_a);
+    expect(roomRecord?.payload.result_b).toEqual(body.result_b);
+    expect(roomRecord?.payload.updated_at).toBe(body.executedAt);
 
     fetchSpy.mockRestore();
   });
