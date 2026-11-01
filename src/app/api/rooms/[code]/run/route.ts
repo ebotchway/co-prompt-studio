@@ -79,8 +79,22 @@ async function executeVariant(
     );
 
     if (!response.ok) {
-      await response.body?.cancel();
-      throw new Error(`Gemini HTTP ${response.status}`);
+      let upstreamCode = "UNKNOWN";
+
+      try {
+        const body = await response.json();
+        const code = body?.error?.status;
+
+        if (typeof code === "string") {
+          upstreamCode = code.slice(0, 80);
+        }
+      } catch {
+        // The upstream error body may not be JSON.
+      }
+
+      throw new Error(
+        `Gemini HTTP ${response.status}; status=${upstreamCode}`
+      );
     }
 
     const json = await response.json();
