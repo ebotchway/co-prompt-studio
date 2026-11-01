@@ -223,7 +223,8 @@ on realtime.messages
 for select
 to authenticated
 using (
-  realtime.topic() like 'coprompt-room-%'
+  realtime.extension in ('broadcast', 'presence')
+  and realtime.topic() like 'coprompt-room-%'
   and public.is_room_member(
     replace(realtime.topic(), 'coprompt-room-', '')
   )
@@ -237,7 +238,8 @@ on realtime.messages
 for insert
 to authenticated
 with check (
-  realtime.topic() like 'coprompt-room-%'
+  realtime.extension in ('broadcast', 'presence')
+  and realtime.topic() like 'coprompt-room-%'
   and public.is_room_member(
     replace(realtime.topic(), 'coprompt-room-', '')
   )

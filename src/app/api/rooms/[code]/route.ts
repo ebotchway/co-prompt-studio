@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { serverDb } from "@/lib/supabase";
-import { authenticateRoom } from "@/lib/security/auth";
+import { authenticateMember } from "@/lib/security/auth";
 import { checkRoomPatchLimit } from "@/lib/security/rate-limit";
 
 type Context = {
@@ -34,7 +34,7 @@ export async function GET(
   try {
     const db = serverDb();
 
-    const auth = await authenticateRoom(db, code, _request);
+    const auth = await authenticateMember(db, code, _request);
 
     if (!auth.ok) return auth.response;
 
@@ -92,7 +92,7 @@ export async function PATCH(
   try {
     const db = serverDb();
 
-    const auth = await authenticateRoom(db, code, request);
+    const auth = await authenticateMember(db, code, request);
 
     if (!auth.ok) return auth.response;
 

@@ -9,6 +9,6 @@ export function createBrowserClient() {
   }
 
   return createClient(url, key, {
-    auth: { persistSession: false },
+    auth: { persistSession: true },
   });
 }

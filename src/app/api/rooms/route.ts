@@ -30,6 +30,26 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const authJwt = request.headers.get("x-supabase-auth");
+
+    if (!authJwt) {
+      return NextResponse.json(
+        { error: "Sign in to create a room" },
+        { status: 401 }
+      );
+    }
+
+    const { data: userData, error: userError } = await db.auth.getUser(
+      authJwt
+    );
+
+    if (userError || !userData?.user) {
+      return NextResponse.json(
+        { error: "Invalid client session" },
+        { status: 401 }
+      );
+    }
+
     for (let attempt = 0; attempt < 20; attempt++) {
       const code = String(randomInt(1000, 10000));
       const { token, tokenHash } = createAccessToken();
@@ -44,6 +64,7 @@ export async function POST(request: NextRequest) {
           test_input: "What is machine learning?",
           temperature: 0.7,
           access_token_hash: tokenHash,
+          access_token_issued_at: new Date().toISOString(),
         })
         .select(
           "code, prompt_a, prompt_b, system_prompt, test_input, temperature, result_a, result_b, updated_at, created_at"
@@ -52,6 +73,23 @@ export async function POST(request: NextRequest) {
         .returns<CreatedRoom>();
 
       if (!error && data) {
+        const { data: membership, error: memberError } = await db
+          .from("room_memberships")
+          .insert({
+            room_code: code,
+            auth_user_id: userData.user.id,
+            role: "owner",
+          })
+          .select("id")
+          .single();
+
+        if (memberError || !membership) throw memberError;
+
+        await db
+          .from("studio_rooms")
+          .update({ owner_member_id: membership.id })
+          .eq("code", code);
+
         return NextResponse.json(
           { room: data, accessToken: token },
           { status: 201 }

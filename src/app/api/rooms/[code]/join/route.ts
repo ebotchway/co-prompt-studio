@@ -59,44 +59,18 @@ export async function POST(
       );
     }
 
-    const { data: roomRow, error: roomError } = await db
-      .from("studio_rooms")
-      .select("code, owner_member_id")
-      .eq("code", code)
-      .maybeSingle();
-
-    if (roomError) throw roomError;
-
-    if (!roomRow) {
-      return NextResponse.json(
-        { error: "Room not found" },
-        { status: 404 }
-      );
-    }
-
     const userId = userData.user.id;
-    let role = roomRow.owner_member_id ? "member" : "owner";
 
-    let inserted = await db
+    const inserted = await db
       .from("room_memberships")
-      .insert({ room_code: code, auth_user_id: userId, role })
+      .insert({
+        room_code: code,
+        auth_user_id: userId,
+        role: "member",
+      })
       .select("id, role")
       .single()
       .returns<MembershipRow>();
-
-    if (
-      inserted.error?.code === "23505" &&
-      role === "owner"
-    ) {
-      role = "member";
-
-      inserted = await db
-        .from("room_memberships")
-        .insert({ room_code: code, auth_user_id: userId, role })
-        .select("id, role")
-        .single()
-        .returns<MembershipRow>();
-    }
 
     if (inserted.error) {
       if (inserted.error.code === "23505") {
@@ -117,17 +91,9 @@ export async function POST(
       throw inserted.error;
     }
 
-    if (role === "owner" && inserted.data) {
-      await db
-        .from("studio_rooms")
-        .update({ owner_member_id: inserted.data.id })
-        .eq("code", code)
-        .is("owner_member_id", null);
-    }
-
     return NextResponse.json({
       joined: true,
-      role: inserted.data?.role ?? role,
+      role: inserted.data?.role ?? "member",
     });
   } catch (error) {
     console.error("Join room:", error);

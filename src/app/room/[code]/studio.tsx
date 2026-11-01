@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { GitCompareArrows, Play } from "lucide-react";
 import type { ComparisonResponse, ComparisonResult } from "@/lib/comparison-types";
@@ -46,6 +46,11 @@ export default function Studio({ code }: { code: string }) {
   const [needsInvite, setNeedsInvite] = useState(false);
   const [latestRun, setLatestRun] = useState<RoomRun | null>(null);
   const client = useRef<ReturnType<typeof createBrowserClient> | null>(null);
+  const tokenRef = useRef<string | null>(null);
+  const supabase = useMemo(() => {
+    if (typeof window === "undefined") return null;
+    return createBrowserClient();
+  }, []);
   const channel = useRef<RealtimeChannel | null>(null);
   const identity = useRef("");
   const timers = useRef<
@@ -54,14 +59,46 @@ export default function Studio({ code }: { code: string }) {
   const focused = useRef<EditableField | null>(null);
   const latest = useRef<StudioRoom | null>(null);
 
+  const ensureSignedIn = useCallback(async () => {
+    if (!supabase) return null;
+
+    const existing = (await supabase.auth.getSession()).data.session;
+
+    if (existing?.access_token) return existing;
+
+    const { error } = await supabase.auth.signInAnonymously();
+
+    if (error) {
+      console.error("Anonymous sign-in unavailable");
+      return null;
+    }
+
+    return (await supabase.auth.getSession()).data.session;
+  }, [supabase]);
+
+  const authHeaders = useCallback(async () => {
+    const token = tokenRef.current ?? loadAccessToken(code);
+
+    if (!supabase) return token ? { Authorization: `Bearer ${token}` } : {};
+
+    const session = (await supabase.auth.getSession()).data.session;
+
+    return {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(session?.access_token
+        ? { "x-supabase-auth": session.access_token }
+        : {}),
+    };
+  }, [code, supabase]);
+
   const loadRoom = useCallback(async () => {
-    const token = accessToken ?? loadAccessToken(code);
+    const token = tokenRef.current ?? loadAccessToken(code);
 
     if (token) {
       try {
         const response = await fetch(`/api/rooms/${code}`, {
           cache: "no-store",
-          headers: { Authorization: `Bearer ${token}` },
+          headers: await authHeaders(),
         });
 
         const json = await response.json();
@@ -82,7 +119,7 @@ export default function Studio({ code }: { code: string }) {
     }
 
     setLoading(false);
-  }, [code, accessToken]);
+  }, [code, authHeaders]);
 
   useEffect(() => {
     let active = true;
@@ -99,12 +136,14 @@ export default function Studio({ code }: { code: string }) {
 
       if (!active) return;
 
+      tokenRef.current = token;
       setAccessToken(token);
+      await ensureSignedIn();
 
       try {
         const response = await fetch(`/api/rooms/${code}`, {
           cache: "no-store",
-          headers: { Authorization: `Bearer ${token}` },
+          headers: await authHeaders(),
         });
 
         const json = await response.json();
@@ -113,6 +152,7 @@ export default function Studio({ code }: { code: string }) {
 
         if (!response.ok) {
           if (response.status === 401) setNeedsInvite(true);
+          if (response.status === 403) setNeedsInvite(true);
           throw new Error(json.error || "Room unavailable");
         }
 
@@ -133,25 +173,18 @@ export default function Studio({ code }: { code: string }) {
     return () => {
       active = false;
     };
-  }, [code]);
+  }, [code, ensureSignedIn, authHeaders]);
 
   useEffect(() => {
-    if (!accessToken) return;
+    if (!accessToken || !supabase) return;
 
-    const supabase = createBrowserClient();
     client.current = supabase;
 
     const me = `Guest-${crypto.randomUUID().slice(0, 6)}`;
     identity.current = me;
 
     void (async () => {
-      try {
-        await supabase.auth.signInAnonymously();
-      } catch {
-        console.error("Anonymous sign-in unavailable");
-      }
-
-      const session = (await supabase.auth.getSession()).data.session;
+      const session = await ensureSignedIn();
 
       await fetch(`/api/rooms/${code}/join`, {
         method: "POST",
@@ -234,7 +267,7 @@ export default function Studio({ code }: { code: string }) {
       client.current = null;
       void supabase.removeChannel(roomChannel);
     };
-  }, [code, accessToken, loadRoom]);
+  }, [code, accessToken, loadRoom, supabase, ensureSignedIn]);
 
   useEffect(() => {
     const activeTimers = timers.current;
@@ -251,7 +284,7 @@ export default function Studio({ code }: { code: string }) {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${accessToken}`,
+          ...(await authHeaders()),
         },
         body: JSON.stringify({
           [field]: value,
@@ -348,7 +381,7 @@ export default function Studio({ code }: { code: string }) {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${accessToken}`,
+          ...(await authHeaders()),
         },
         body: JSON.stringify(payload),
       });

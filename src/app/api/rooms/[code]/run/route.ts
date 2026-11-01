@@ -5,7 +5,7 @@ import { serverDb } from "@/lib/supabase";
 import type {
   ComparisonResult,
 } from "@/lib/comparison-types";
-import { authenticateRoom } from "@/lib/security/auth";
+import { authenticateMember } from "@/lib/security/auth";
 import {
   checkRunQuota,
   RateLimitUnavailableError,
@@ -167,7 +167,7 @@ export async function POST(
   try {
     db = serverDb();
 
-    const auth = await authenticateRoom(db, code, request);
+    const auth = await authenticateMember(db, code, request);
 
     if (!auth.ok) return auth.response;
 

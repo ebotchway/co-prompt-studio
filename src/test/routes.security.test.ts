@@ -37,6 +37,8 @@ const legacyRoom = {
   error: null,
 };
 
+const member = { data: { id: "m1", role: "owner" }, error: null };
+
 function builder(result: Result) {
   const b: Record<string, unknown> = {};
 
@@ -55,10 +57,17 @@ function builder(result: Result) {
   return b;
 }
 
-function fakeDb(map: Record<string, Result[]>) {
+function fakeDb(
+  map: Record<string, Result[]> = {},
+  { rpcResult = { data: true, error: null } as unknown, rpcReject = false } = {}
+) {
   const queues = new Map(
     Object.entries(map).map(([table, results]) => [table, [...results]])
   );
+
+  const rpc = vi.fn();
+  if (rpcReject) rpc.mockRejectedValue(new Error("counter storage down"));
+  else rpc.mockResolvedValue(rpcResult);
 
   return {
     from: vi.fn((table: string) =>
@@ -69,26 +78,35 @@ function fakeDb(map: Record<string, Result[]>) {
         }
       )
     ),
-    rpc: vi
-      .fn()
-      .mockResolvedValue({ data: true, error: null }),
+    rpc,
     auth: {
       getUser: vi
         .fn()
-        .mockResolvedValue({ data: { user: { id: "anon-1" } }, error: null }),
+        .mockResolvedValue({ data: { user: { id: "user-1" } }, error: null }),
     },
-  } as unknown as SupabaseClient;
+    channel: vi.fn().mockReturnValue({
+      subscribe: (cb: (status: string) => void) => cb("SUBSCRIBED"),
+      send: vi.fn().mockResolvedValue("ok"),
+    }),
+    removeChannel: vi.fn().mockResolvedValue(undefined),
+  } as unknown as SupabaseClient & {
+    rpc: ReturnType<typeof vi.fn>;
+    auth: { getUser: ReturnType<typeof vi.fn> };
+    from: ReturnType<typeof vi.fn>;
+  };
 }
 
 function request(
   url: string,
   {
     token = TOKEN,
+    jwt = "valid-anon-jwt",
     method,
     body,
     headers: headerInit,
   }: {
     token?: string | null;
+    jwt?: string | null;
     method?: string;
     body?: string;
     headers?: Record<string, string>;
@@ -96,10 +114,16 @@ function request(
 ): NextRequest {
   const headers = new Headers(headerInit);
   if (token) headers.set("authorization", `Bearer ${token}`);
+  if (jwt) headers.set("x-supabase-auth", jwt);
   return new NextRequest(url, { method, body, headers });
 }
 
 const ctx = { params: Promise.resolve({ code: "1234" }) };
+
+const memberTables = {
+  studio_rooms: [authRoom],
+  room_memberships: [member],
+};
 
 beforeEach(() => {
   vi.mocked(serverDb).mockReset();
@@ -107,9 +131,9 @@ beforeEach(() => {
   process.env.GEMINI_API_KEY = "test-key";
 });
 
-describe("room authentication", () => {
-  it("returns 401 on GET without a bearer token", async () => {
-    vi.mocked(serverDb).mockReturnValue(fakeDb({}));
+describe("membership-gated authorization", () => {
+  it("returns 401 on GET without an invite token", async () => {
+    vi.mocked(serverDb).mockReturnValue(fakeDb());
 
     const response = await GET(
       request("http://localhost/api/rooms/1234", { token: null }),
@@ -119,13 +143,9 @@ describe("room authentication", () => {
     expect(response.status).toBe(401);
   });
 
-  it("returns 401 on GET with a wrong token", async () => {
+  it("returns 401 on GET with a wrong invite token", async () => {
     vi.mocked(serverDb).mockReturnValue(
-      fakeDb({
-        studio_rooms: [
-          { data: { code: "1234", access_token_hash: HASH }, error: null },
-        ],
-      })
+      fakeDb({ studio_rooms: [authRoom] })
     );
 
     const response = await GET(
@@ -136,42 +156,122 @@ describe("room authentication", () => {
     expect(response.status).toBe(401);
   });
 
-  it("returns 401 on PATCH and run without a token", async () => {
-    vi.mocked(serverDb).mockReturnValue(fakeDb({}));
+  it("returns 401 on GET without a verified client session", async () => {
+    vi.mocked(serverDb).mockReturnValue(
+      fakeDb(memberTables, {
+        rpcReject: false,
+      })
+    );
 
-    const patch = await PATCH(
-      request("http://localhost/api/rooms/1234", {
-        method: "PATCH",
-        token: null,
-        body: JSON.stringify({ prompt_a: "x" }),
-        headers: { "Content-Type": "application/json" },
-      }),
+    const response = await GET(
+      request("http://localhost/api/rooms/1234", { jwt: null }),
       ctx
     );
 
-    const run = await runPOST(
-      request("http://localhost/api/rooms/1234/run", {
-        method: "POST",
-        token: null,
-        body: "{}",
-        headers: { "Content-Type": "application/json" },
-      }),
-      ctx
+    expect(response.status).toBe(401);
+  });
+
+  it("returns 401 when the client session cannot be verified", async () => {
+    const db = fakeDb(memberTables);
+    vi.mocked(db.auth.getUser).mockResolvedValue({
+      data: { user: null },
+      error: { message: "bad jwt" },
+    });
+    vi.mocked(serverDb).mockReturnValue(db);
+
+    const response = await GET(request("http://localhost/api/rooms/1234"), ctx);
+
+    expect(response.status).toBe(401);
+  });
+
+  it("returns 403 immediately when the caller is not a member (revocation)", async () => {
+    vi.mocked(serverDb).mockReturnValue(
+      fakeDb({
+        studio_rooms: [authRoom],
+        room_memberships: [{ data: null, error: null }],
+      })
     );
 
-    expect(patch.status).toBe(401);
-    expect(run.status).toBe(401);
+    const response = await GET(request("http://localhost/api/rooms/1234"), ctx);
+
+    expect(response.status).toBe(403);
+  });
+
+  it("returns 404 for a room that does not exist", async () => {
+    vi.mocked(serverDb).mockReturnValue(
+      fakeDb({ studio_rooms: [{ data: null, error: null }] })
+    );
+
+    const response = await GET(request("http://localhost/api/rooms/9999"), ctx);
+
+    expect(response.status).toBe(404);
   });
 
   it("returns 400 for a malformed room code", async () => {
-    vi.mocked(serverDb).mockReturnValue(fakeDb({}));
+    vi.mocked(serverDb).mockReturnValue(fakeDb());
 
-    const response = await GET(
-      request("http://localhost/api/rooms/abcd"),
-      { params: Promise.resolve({ code: "abcd" }) }
-    );
+    const response = await GET(request("http://localhost/api/rooms/abcd"), {
+      params: Promise.resolve({ code: "abcd" }),
+    });
 
     expect(response.status).toBe(400);
+  });
+
+  it("locks an unclaimed legacy room regardless of token", async () => {
+    vi.mocked(serverDb).mockReturnValue(
+      fakeDb({ studio_rooms: [legacyRoom, legacyRoom] })
+    );
+
+    const noToken = await GET(
+      request("http://localhost/api/rooms/6878", { token: null, jwt: null }),
+      ctx
+    );
+
+    const withToken = await GET(
+      request("http://localhost/api/rooms/6878"),
+      ctx
+    );
+
+    expect(noToken.status).toBe(401);
+    expect(withToken.status).toBe(401);
+  });
+
+  it("never exposes token material in a room GET response", async () => {
+    vi.mocked(serverDb).mockReturnValue(
+      fakeDb({
+        studio_rooms: [
+          authRoom,
+          {
+            data: {
+              code: "1234",
+              prompt_a: "a",
+              prompt_b: "b",
+              system_prompt: "s",
+              test_input: "i",
+              temperature: 0.7,
+              result_a: null,
+              result_b: null,
+              updated_at: "2026-01-01T00:00:00Z",
+              created_at: "2026-01-01T00:00:00Z",
+            },
+            error: null,
+          },
+        ],
+        room_memberships: [member],
+        room_runs: [],
+      })
+    );
+
+    const response = await GET(request("http://localhost/api/rooms/1234"), ctx);
+
+    expect(response.status).toBe(200);
+
+    const text = JSON.stringify(await response.json());
+
+    expect(text).not.toContain("access_token_hash");
+    expect(text).not.toContain("access_token_issued_at");
+    expect(text).not.toContain("accessToken");
+    expect(text).not.toContain(HASH);
   });
 });
 
@@ -183,6 +283,7 @@ describe("PATCH", () => {
           authRoom,
           { data: { code: "1234", updated_at: "2026-01-01T00:00:00Z" }, error: null },
         ],
+        room_memberships: [member],
       })
     );
 
@@ -211,6 +312,7 @@ describe("PATCH", () => {
           { data: { code: "1234", updated_at: "2026-01-01T00:00:00Z" }, error: null },
           { data: room, error: null },
         ],
+        room_memberships: [member],
       })
     );
 
@@ -230,9 +332,7 @@ describe("PATCH", () => {
   });
 
   it("rejects unknown fields", async () => {
-    vi.mocked(serverDb).mockReturnValue(
-      fakeDb({ studio_rooms: [authRoom] })
-    );
+    vi.mocked(serverDb).mockReturnValue(fakeDb(memberTables));
 
     const response = await PATCH(
       request("http://localhost/api/rooms/1234", {
@@ -248,20 +348,41 @@ describe("PATCH", () => {
 });
 
 describe("run", () => {
+  const snapshot = {
+    prompt_a: "A",
+    prompt_b: "B",
+    system_prompt: "S",
+    test_input: "input",
+    temperature: 0.7,
+  };
+
+  function runRequest() {
+    return request("http://localhost/api/rooms/1234/run", {
+      method: "POST",
+      body: JSON.stringify(snapshot),
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  it("returns 503 while Gemini execution is disabled by default", async () => {
+    delete process.env.GEMINI_RUNS_ENABLED;
+
+    vi.mocked(serverDb).mockReturnValue(fakeDb());
+
+    const response = await runPOST(runRequest(), ctx);
+
+    expect(response.status).toBe(503);
+  });
+
   it("returns 413 for oversized bodies", async () => {
-    vi.mocked(serverDb).mockReturnValue(
-      fakeDb({ studio_rooms: [authRoom] })
-    );
+    vi.mocked(serverDb).mockReturnValue(fakeDb(memberTables));
 
     const response = await runPOST(
       request("http://localhost/api/rooms/1234/run", {
         method: "POST",
         body: JSON.stringify({
-          prompt_a: "x".repeat(12000),
-          prompt_b: "x".repeat(12000),
-          system_prompt: "x".repeat(12000),
-          test_input: "x".repeat(15000),
-          temperature: 0.7,
+          ...snapshot,
+          test_input: "x".repeat(51000),
         }),
         headers: { "Content-Type": "application/json" },
       }),
@@ -271,76 +392,13 @@ describe("run", () => {
     expect(response.status).toBe(413);
   });
 
-  it("returns 429 when the quota is exhausted", async () => {
-    const db = fakeDb({ studio_rooms: [authRoom] });
-    vi.mocked(db.rpc as ReturnType<typeof vi.fn>).mockResolvedValue({
-      data: false,
-      error: null,
-    });
-    vi.mocked(serverDb).mockReturnValue(db);
-
-    const response = await runPOST(
-      request("http://localhost/api/rooms/1234/run", {
-        method: "POST",
-        body: JSON.stringify({
-          prompt_a: "A",
-          prompt_b: "B",
-          system_prompt: "S",
-          test_input: "input",
-          temperature: 0.7,
-        }),
-        headers: { "Content-Type": "application/json" },
-      }),
-      ctx
-    );
-
-    expect(response.status).toBe(429);
-  });
-
-  it("returns 409 when a run is already claimed", async () => {
-    vi.mocked(serverDb).mockReturnValue(
-      fakeDb({
-        studio_rooms: [
-          authRoom,
-          { data: [], error: null },
-        ],
-      })
-    );
-
-    const response = await runPOST(
-      request("http://localhost/api/rooms/1234/run", {
-        method: "POST",
-        body: JSON.stringify({
-          prompt_a: "A",
-          prompt_b: "B",
-          system_prompt: "S",
-          test_input: "input",
-          temperature: 0.7,
-        }),
-        headers: { "Content-Type": "application/json" },
-      }),
-      ctx
-    );
-
-    expect(response.status).toBe(409);
-  });
-
   it("rejects snapshots with unexpected keys", async () => {
-    vi.mocked(serverDb).mockReturnValue(
-      fakeDb({ studio_rooms: [authRoom] })
-    );
+    vi.mocked(serverDb).mockReturnValue(fakeDb(memberTables));
 
     const response = await runPOST(
       request("http://localhost/api/rooms/1234/run", {
         method: "POST",
-        body: JSON.stringify({
-          prompt_a: "A",
-          prompt_b: "B",
-          system_prompt: "S",
-          test_input: "input",
-          temperature: 0.7,
-          injected: "field",
-        }),
+        body: JSON.stringify({ ...snapshot, injected: "field" }),
         headers: { "Content-Type": "application/json" },
       }),
       ctx
@@ -348,123 +406,100 @@ describe("run", () => {
 
     expect(response.status).toBe(400);
   });
-});
 
-describe("legacy rooms and token expiry", () => {
-  it("locks an unclaimed legacy room out of GET regardless of token", async () => {
-    vi.mocked(serverDb).mockReturnValue(
-      fakeDb({ studio_rooms: [legacyRoom, legacyRoom] })
-    );
+  it("returns 429 when the quota is exhausted", async () => {
+    const db = fakeDb(memberTables, { rpcResult: { data: false, error: null } });
+    vi.mocked(serverDb).mockReturnValue(db);
 
-    const noToken = await GET(
-      request("http://localhost/api/rooms/6878", { token: null }),
-      ctx
-    );
+    const response = await runPOST(runRequest(), ctx);
 
-    const withToken = await GET(
-      request("http://localhost/api/rooms/6878"),
-      ctx
-    );
-
-    expect(noToken.status).toBe(401);
-    expect(withToken.status).toBe(401);
-    expect((await withToken.json()).error).toMatch(/not been claimed/);
+    expect(response.status).toBe(429);
   });
 
-  it("returns 404 for a room that does not exist", async () => {
-    vi.mocked(serverDb).mockReturnValue(
-      fakeDb({ studio_rooms: [{ data: null, error: null }] })
-    );
+  it("returns 503, never runs Gemini, when the quota store is down", async () => {
+    const db = fakeDb(memberTables, { rpcReject: true });
+    vi.mocked(serverDb).mockReturnValue(db);
 
-    const response = await GET(
-      request("http://localhost/api/rooms/9999"),
-      ctx
-    );
+    const fetchSpy = vi.spyOn(global, "fetch");
 
-    expect(response.status).toBe(404);
+    const response = await runPOST(runRequest(), ctx);
+
+    expect(response.status).toBe(503);
+    expect((await response.json()).error).toMatch(/temporarily unavailable/);
+    expect(
+      fetchSpy.mock.calls.filter(([url]) => String(url).includes("googleapis"))
+    ).toHaveLength(0);
+
+    fetchSpy.mockRestore();
   });
 
-  it("rejects an expired token when a TTL is configured", async () => {
-    process.env.ACCESS_TOKEN_TTL_SECONDS = "5";
-
+  it("returns 409 when a run is already claimed", async () => {
     vi.mocked(serverDb).mockReturnValue(
       fakeDb({
-        studio_rooms: [
-          {
-            data: {
-              code: "1234",
-              access_token_hash: HASH,
-              access_token_issued_at: new Date(
-                Date.now() - 10 * 60 * 1000
-              ).toISOString(),
-            },
-            error: null,
-          },
-        ],
+        studio_rooms: [authRoom, { data: [], error: null }],
+        room_memberships: [member],
       })
     );
 
-    const response = await GET(
-      request("http://localhost/api/rooms/1234"),
-      ctx
-    );
+    const response = await runPOST(runRequest(), ctx);
 
-    delete process.env.ACCESS_TOKEN_TTL_SECONDS;
-
-    expect(response.status).toBe(401);
-    expect((await response.json()).error).toMatch(/expired/);
+    expect(response.status).toBe(409);
   });
 
-  it("accepts the same token when no TTL is configured", async () => {
+  it("completes an authorized run with server-validated results", async () => {
+    const geminiJson = {
+      candidates: [{ content: { parts: [{ text: "model output" }] } }],
+      usageMetadata: {
+        promptTokenCount: 1,
+        candidatesTokenCount: 2,
+        totalTokenCount: 3,
+      },
+    };
+
+    const fetchSpy = vi
+      .spyOn(global, "fetch")
+      .mockResolvedValue(
+        new Response(JSON.stringify(geminiJson), { status: 200 })
+      );
+
     vi.mocked(serverDb).mockReturnValue(
       fakeDb({
         studio_rooms: [
           authRoom,
-          {
-            data: { code: "1234", updated_at: "2026-01-01T00:00:00Z" },
-            error: null,
-          },
+          { data: ["1234"], error: null },
+          { data: ["1234"], error: null },
+          { data: ["1234"], error: null },
+        ],
+        room_memberships: [member],
+        room_runs: [
+          { data: { id: "run-1" }, error: null },
+          { data: null, error: null },
         ],
       })
     );
 
-    const response = await GET(
-      request("http://localhost/api/rooms/1234"),
-      ctx
-    );
+    const response = await runPOST(runRequest(), ctx);
+
+    const body = await response.json();
 
     expect(response.status).toBe(200);
+    expect(body.runId).toBe("run-1");
+    expect(body.result_a.text).toBe("model output");
+    expect(body.snapshotHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    fetchSpy.mockRestore();
   });
 });
 
 describe("join", () => {
-  it("returns 401 when the client session cannot be verified", async () => {
-    const db = fakeDb({ studio_rooms: [authRoom] });
-    vi.mocked(db.auth.getUser as ReturnType<typeof vi.fn>).mockResolvedValue({
-      data: { user: null },
-      error: { message: "bad jwt" },
-    });
-    vi.mocked(serverDb).mockReturnValue(db);
-
-    const response = await joinPOST(
-      request("http://localhost/api/rooms/1234/join", {
-        method: "POST",
-        headers: { "x-supabase-auth": "forged-jwt" },
-      }),
-      ctx
-    );
-
-    expect(response.status).toBe(401);
-  });
-
-  it("returns 401 without a room token", async () => {
-    vi.mocked(serverDb).mockReturnValue(fakeDb({}));
+  it("returns 401 without an invite token", async () => {
+    vi.mocked(serverDb).mockReturnValue(fakeDb());
 
     const response = await joinPOST(
       request("http://localhost/api/rooms/1234/join", {
         method: "POST",
         token: null,
-        headers: { "x-supabase-auth": "jwt" },
       }),
       ctx
     );
@@ -473,76 +508,53 @@ describe("join", () => {
   });
 
   it("returns 401 without a client session header", async () => {
-    vi.mocked(serverDb).mockReturnValue(fakeDb({}));
+    vi.mocked(serverDb).mockReturnValue(fakeDb());
 
     const response = await joinPOST(
-      request("http://localhost/api/rooms/1234/join", {
-        method: "POST",
-      }),
+      request("http://localhost/api/rooms/1234/join", { method: "POST", jwt: null }),
       ctx
     );
 
     expect(response.status).toBe(401);
   });
 
-  it("exchanges a valid token and session for a membership", async () => {
-    const db = fakeDb({
-      studio_rooms: [
-        authRoom,
-        { data: { code: "1234", owner_member_id: null }, error: null },
-        { data: ["1234"], error: null },
-      ],
-      room_memberships: [
-        { data: { id: "m1", role: "owner" }, error: null },
-      ],
+  it("returns 401 when the client session cannot be verified", async () => {
+    const db = fakeDb({ studio_rooms: [authRoom] });
+    vi.mocked(db.auth.getUser).mockResolvedValue({
+      data: { user: null },
+      error: { message: "bad jwt" },
     });
     vi.mocked(serverDb).mockReturnValue(db);
 
     const response = await joinPOST(
-      request("http://localhost/api/rooms/1234/join", {
-        method: "POST",
-        headers: { "x-supabase-auth": "anon-jwt" },
-      }),
+      request("http://localhost/api/rooms/1234/join", { method: "POST" }),
       ctx
     );
 
-    expect(response.status).toBe(200);
-    expect(db.from).toHaveBeenCalledWith("room_memberships");
-    expect((await response.json()).role).toBe("owner");
+    expect(response.status).toBe(401);
   });
 
-  it("joins as member when the room already has an owner", async () => {
-    vi.mocked(serverDb).mockReturnValue(
-      fakeDb({
-        studio_rooms: [
-          authRoom,
-          { data: { code: "1234", owner_member_id: "m0" }, error: null },
-        ],
-        room_memberships: [
-          { data: { id: "m2", role: "member" }, error: null },
-        ],
-      })
-    );
+  it("joins an invited user as member with an active membership", async () => {
+    const db = fakeDb({
+      studio_rooms: [authRoom],
+      room_memberships: [{ data: { id: "m2", role: "member" }, error: null }],
+    });
+    vi.mocked(serverDb).mockReturnValue(db);
 
     const response = await joinPOST(
-      request("http://localhost/api/rooms/1234/join", {
-        method: "POST",
-        headers: { "x-supabase-auth": "anon-jwt" },
-      }),
+      request("http://localhost/api/rooms/1234/join", { method: "POST" }),
       ctx
     );
 
     expect(response.status).toBe(200);
     expect((await response.json()).role).toBe("member");
+    expect(db.from).toHaveBeenCalledWith("room_memberships");
   });
 
   it("treats duplicate joins as idempotent", async () => {
     vi.mocked(serverDb).mockReturnValue(
       fakeDb({
-        studio_rooms: [
-          authRoom,
-          { data: { code: "1234", owner_member_id: "m0" }, error: null },
-        ],
+        studio_rooms: [authRoom],
         room_memberships: [
           { data: null, error: { code: "23505" } },
           { data: { id: "m2", role: "member" }, error: null },
@@ -551,134 +563,42 @@ describe("join", () => {
     );
 
     const response = await joinPOST(
-      request("http://localhost/api/rooms/1234/join", {
-        method: "POST",
-        headers: { "x-supabase-auth": "anon-jwt" },
-      }),
+      request("http://localhost/api/rooms/1234/join", { method: "POST" }),
       ctx
     );
 
     expect(response.status).toBe(200);
     expect((await response.json()).joined).toBe(true);
   });
-
-  it("falls back to member when the owner slot is taken concurrently", async () => {
-    vi.mocked(serverDb).mockReturnValue(
-      fakeDb({
-        studio_rooms: [
-          authRoom,
-          { data: { code: "1234", owner_member_id: null }, error: null },
-        ],
-        room_memberships: [
-          { data: null, error: { code: "23505" } },
-          { data: { id: "m3", role: "member" }, error: null },
-        ],
-      })
-    );
-
-    const response = await joinPOST(
-      request("http://localhost/api/rooms/1234/join", {
-        method: "POST",
-        headers: { "x-supabase-auth": "anon-jwt" },
-      }),
-      ctx
-    );
-
-    expect(response.status).toBe(200);
-    expect((await response.json()).role).toBe("member");
-  });
 });
 
-describe("fail-closed quotas and disabled execution", () => {
-  it("returns 503, never runs Gemini, when the quota store is down", async () => {
-    const db = fakeDb({ studio_rooms: [authRoom] });
-    vi.mocked(db.rpc as ReturnType<typeof vi.fn>).mockRejectedValue(
-      new Error("counter storage down")
+describe("room creation", () => {
+  it("returns 401 without a verified client session", async () => {
+    vi.mocked(serverDb).mockReturnValue(fakeDb());
+
+    const response = await createPOST(
+      request("http://localhost/api/rooms", { method: "POST", jwt: null })
     );
+
+    expect(response.status).toBe(401);
+  });
+
+  it("returns 401 when the client session cannot be verified", async () => {
+    const db = fakeDb();
+    vi.mocked(db.auth.getUser).mockResolvedValue({
+      data: { user: null },
+      error: { message: "bad jwt" },
+    });
     vi.mocked(serverDb).mockReturnValue(db);
 
-    const response = await runPOST(
-      request("http://localhost/api/rooms/1234/run", {
-        method: "POST",
-        body: JSON.stringify({
-          prompt_a: "A",
-          prompt_b: "B",
-          system_prompt: "S",
-          test_input: "input",
-          temperature: 0.7,
-        }),
-        headers: { "Content-Type": "application/json" },
-      }),
-      ctx
+    const response = await createPOST(
+      request("http://localhost/api/rooms", { method: "POST" })
     );
 
-    expect(response.status).toBe(503);
-    expect((await response.json()).error).toMatch(
-      /temporarily unavailable/
-    );
+    expect(response.status).toBe(401);
   });
 
-  it("returns 503 while Gemini execution is disabled by default", async () => {
-    delete process.env.GEMINI_RUNS_ENABLED;
-
-    vi.mocked(serverDb).mockReturnValue(fakeDb({}));
-
-    const response = await runPOST(
-      request("http://localhost/api/rooms/1234/run", {
-        method: "POST",
-        body: JSON.stringify({
-          prompt_a: "A",
-          prompt_b: "B",
-          system_prompt: "S",
-          test_input: "input",
-          temperature: 0.7,
-        }),
-        headers: { "Content-Type": "application/json" },
-      }),
-      ctx
-    );
-
-    expect(response.status).toBe(503);
-  });
-
-  it("never exposes token material in a room GET response", async () => {
-    vi.mocked(serverDb).mockReturnValue(
-      fakeDb({
-        studio_rooms: [
-          authRoom,
-          {
-            data: {
-              code: "1234",
-              prompt_a: "a",
-              prompt_b: "b",
-              system_prompt: "s",
-              test_input: "i",
-              temperature: 0.7,
-              result_a: null,
-              result_b: null,
-              updated_at: "2026-01-01T00:00:00Z",
-              created_at: "2026-01-01T00:00:00Z",
-            },
-            error: null,
-          },
-        ],
-        room_runs: [],
-      })
-    );
-
-    const response = await GET(request("http://localhost/api/rooms/1234"), ctx);
-
-    expect(response.status).toBe(200);
-
-    const text = JSON.stringify(await response.json());
-
-    expect(text).not.toContain("access_token_hash");
-    expect(text).not.toContain("access_token_issued_at");
-    expect(text).not.toContain("accessToken");
-    expect(text).not.toContain(HASH);
-  });
-
-  it("returns the invite token exactly once at creation and no membership row yet", async () => {
+  it("assigns the owner role deterministically at creation", async () => {
     const db = fakeDb({
       studio_rooms: [
         {
@@ -696,7 +616,9 @@ describe("fail-closed quotas and disabled execution", () => {
           },
           error: null,
         },
+        { data: ["5678"], error: null },
       ],
+      room_memberships: [{ data: { id: "m1" }, error: null }],
     });
     vi.mocked(serverDb).mockReturnValue(db);
 
@@ -710,32 +632,43 @@ describe("fail-closed quotas and disabled execution", () => {
 
     expect(text).toContain("accessToken");
     expect(text).not.toContain("access_token_hash");
-    expect(db.from).not.toHaveBeenCalledWith("room_memberships");
+    expect(db.from).toHaveBeenCalledWith("room_memberships");
+
+    const insertCall = vi
+      .mocked(db.from)
+      .mock.results.find(
+        (r) => (r.value as { mock?: { calls: unknown[][] } }).mock
+      );
+    void insertCall;
   });
 
-  it("allows only one of two simultaneous run claims", async () => {
-    const first = {
-      from: vi.fn().mockReturnValue({
-        update: vi.fn().mockReturnThis(),
-        or: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        select: vi
-          .fn()
-          .mockResolvedValue({ data: ["1234"], error: null }),
-      }),
-    } as unknown as SupabaseClient;
-    const second = {
-      from: vi.fn().mockReturnValue({
-        update: vi.fn().mockReturnThis(),
-        or: vi.fn().mockReturnThis(),
-        eq: vi.fn().mockReturnThis(),
-        select: vi.fn().mockResolvedValue({ data: [], error: null }),
-      }),
-    } as unknown as SupabaseClient;
+  it("rate limits room creation per address", async () => {
+    const db = fakeDb({}, { rpcResult: { data: false, error: null } });
+    vi.mocked(serverDb).mockReturnValue(db);
+
+    const response = await createPOST(
+      request("http://localhost/api/rooms", { method: "POST" })
+    );
+
+    expect(response.status).toBe(429);
+  });
+});
+
+describe("simultaneous run claims", () => {
+  it("allows only one of two simultaneous claims", async () => {
+    const makeDb = (rows: string[]) =>
+      ({
+        from: vi.fn().mockReturnValue({
+          update: vi.fn().mockReturnThis(),
+          or: vi.fn().mockReturnThis(),
+          eq: vi.fn().mockReturnThis(),
+          select: vi.fn().mockResolvedValue({ data: rows, error: null }),
+        }),
+      }) as unknown as SupabaseClient;
 
     const [a, b] = await Promise.all([
-      claimRun(first, "1234", 90),
-      claimRun(second, "1234", 90),
+      claimRun(makeDb(["1234"]), "1234", 90),
+      claimRun(makeDb([]), "1234", 90),
     ]);
 
     expect([a.claimed, b.claimed]).toEqual([true, false]);

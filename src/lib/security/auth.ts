@@ -81,13 +81,73 @@ export async function authenticateRoom(
     }
 
     if (
-      !token ||
       !verifyAccessToken(token, room.access_token_hash) ||
       tokenExpired(room.access_token_issued_at)
     ) {
       return {
         ok: false,
         response: unauthorized("Invalid or expired invite token"),
+      };
+    }
+
+    return { ok: true };
+  } catch {
+    return {
+      ok: false,
+      response: NextResponse.json(
+        { error: "Database error" },
+        { status: 500 }
+      ),
+    };
+  }
+}
+
+export async function authenticateMember(
+  db: SupabaseClient,
+  code: string,
+  request: NextRequest
+): Promise<RoomAuth> {
+  const auth = await authenticateRoom(db, code, request);
+
+  if (!auth.ok) return auth;
+
+  const authJwt = request.headers.get("x-supabase-auth");
+
+  if (!authJwt) {
+    return {
+      ok: false,
+      response: unauthorized("Missing client session"),
+    };
+  }
+
+  try {
+    const { data: userData, error: userError } = await db.auth.getUser(
+      authJwt
+    );
+
+    if (userError || !userData?.user) {
+      return {
+        ok: false,
+        response: unauthorized("Invalid client session"),
+      };
+    }
+
+    const { data: membership, error: memberError } = await db
+      .from("room_memberships")
+      .select("id, role")
+      .eq("room_code", code)
+      .eq("auth_user_id", userData.user.id)
+      .maybeSingle();
+
+    if (memberError) throw memberError;
+
+    if (!membership) {
+      return {
+        ok: false,
+        response: NextResponse.json(
+          { error: "You are not a member of this room" },
+          { status: 403, headers: { "Cache-Control": "no-store" } }
+        ),
       };
     }
 
