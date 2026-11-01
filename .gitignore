@@ -28,3 +28,4 @@ pnpm-debug.log*
 .idea/
 .vscode/
 .vercel/
+supabase/.temp/
