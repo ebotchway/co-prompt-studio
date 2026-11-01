@@ -27,3 +27,7 @@ revoke all on public.studio_rooms from anon, authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE
 ON TABLE public.studio_rooms
 TO service_role;
+
+-- Security hardening objects (memberships, run records, rate limits,
+-- realtime authorization) live in security-hardening.sql.
+\ir security-hardening.sql
