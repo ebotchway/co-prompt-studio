@@ -55,8 +55,39 @@ export default function Studio({ code }: { code: string }) {
   }, [code]);
 
   useEffect(() => {
-    void loadRoom();
-  }, [loadRoom]);
+    let active = true;
+
+    fetch(`/api/rooms/${code}`, { cache: "no-store" })
+      .then(async (response) => {
+        const json = await response.json();
+
+        if (!response.ok) {
+          throw new Error(json.error || "Room unavailable");
+        }
+
+        return json.room as StudioRoom;
+      })
+      .then((data) => {
+        if (!active) return;
+
+        latest.current = data;
+        setRoom(data);
+      })
+      .catch((err: unknown) => {
+        if (!active) return;
+
+        setError(
+          err instanceof Error ? err.message : "Unable to load room"
+        );
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [code]);
 
   useEffect(() => {
     if (!/^[0-9]{4}$/.test(code)) return;
