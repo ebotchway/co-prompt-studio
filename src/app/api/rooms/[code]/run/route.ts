@@ -6,7 +6,10 @@ import type {
   ComparisonResult,
 } from "@/lib/comparison-types";
 import { authenticateRoom } from "@/lib/security/auth";
-import { checkRunQuota } from "@/lib/security/rate-limit";
+import {
+  checkRunQuota,
+  RateLimitUnavailableError,
+} from "@/lib/security/rate-limit";
 import { limits } from "@/lib/security/config";
 import { validSnapshot, snapshotHash, validComparisonResult, type Snapshot } from "@/lib/security/validation";
 import { claimRun, releaseRunClaim } from "@/lib/security/run-claims";
@@ -177,6 +180,14 @@ export async function POST(
       );
     }
   } catch (error) {
+    if (error instanceof RateLimitUnavailableError) {
+      console.error("Run quota store unavailable");
+      return NextResponse.json(
+        { error: "Comparison temporarily unavailable" },
+        { status: 503 }
+      );
+    }
+
     console.error("Comparison setup failed:", error);
     return NextResponse.json(
       { error: "Database error" },

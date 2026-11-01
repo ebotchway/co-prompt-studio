@@ -7,11 +7,18 @@ type RpcResult = {
   error: { message?: string } | null;
 };
 
+export class RateLimitUnavailableError extends Error {
+  constructor() {
+    super("Rate limit counter unavailable");
+  }
+}
+
 export async function consumeRateLimit(
   db: SupabaseClient,
   key: string,
   windowSeconds: number,
-  max: number
+  max: number,
+  { failClosed = false }: { failClosed?: boolean } = {}
 ): Promise<boolean> {
   try {
     const { data, error } = (await db.rpc("consume_rate_limit", {
@@ -24,6 +31,10 @@ export async function consumeRateLimit(
 
     return data === true;
   } catch {
+    if (failClosed) {
+      throw new RateLimitUnavailableError();
+    }
+
     console.error("Rate limit counter unavailable");
 
     return true;
@@ -73,13 +84,15 @@ export async function checkRunQuota(
       db,
       `run-room:${code}`,
       limits.runPerRoom.windowSeconds,
-      limits.runPerRoom.max
+      limits.runPerRoom.max,
+      { failClosed: true }
     ),
     consumeRateLimit(
       db,
       "run-global",
       limits.runGlobal.windowSeconds,
-      limits.runGlobal.max
+      limits.runGlobal.max,
+      { failClosed: true }
     ),
   ]);
 

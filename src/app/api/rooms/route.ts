@@ -52,19 +52,6 @@ export async function POST(request: NextRequest) {
         .returns<CreatedRoom>();
 
       if (!error && data) {
-        const { data: membership, error: memberError } = await db
-          .from("room_memberships")
-          .insert({ room_code: code, role: "owner" })
-          .select("id")
-          .single();
-
-        if (!memberError && membership) {
-          await db
-            .from("studio_rooms")
-            .update({ owner_member_id: membership.id })
-            .eq("code", code);
-        }
-
         return NextResponse.json(
           { room: data, accessToken: token },
           { status: 201 }

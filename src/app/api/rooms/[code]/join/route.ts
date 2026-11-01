@@ -8,6 +8,8 @@ type Context = {
 
 const CODE_PATTERN = /^[0-9]{4}$/;
 
+type MembershipRow = { id: string; role: string };
+
 export async function POST(
   request: NextRequest,
   context: Context
@@ -57,20 +59,76 @@ export async function POST(
       );
     }
 
-    const { error: memberError } = await db
-      .from("room_memberships")
-      .upsert(
-        {
-          room_code: code,
-          auth_user_id: userData.user.id,
-          role: "member",
-        },
-        { onConflict: "room_code,auth_user_id", ignoreDuplicates: true }
+    const { data: roomRow, error: roomError } = await db
+      .from("studio_rooms")
+      .select("code, owner_member_id")
+      .eq("code", code)
+      .maybeSingle();
+
+    if (roomError) throw roomError;
+
+    if (!roomRow) {
+      return NextResponse.json(
+        { error: "Room not found" },
+        { status: 404 }
       );
+    }
 
-    if (memberError) throw memberError;
+    const userId = userData.user.id;
+    let role = roomRow.owner_member_id ? "member" : "owner";
 
-    return NextResponse.json({ joined: true });
+    let inserted = await db
+      .from("room_memberships")
+      .insert({ room_code: code, auth_user_id: userId, role })
+      .select("id, role")
+      .single()
+      .returns<MembershipRow>();
+
+    if (
+      inserted.error?.code === "23505" &&
+      role === "owner"
+    ) {
+      role = "member";
+
+      inserted = await db
+        .from("room_memberships")
+        .insert({ room_code: code, auth_user_id: userId, role })
+        .select("id, role")
+        .single()
+        .returns<MembershipRow>();
+    }
+
+    if (inserted.error) {
+      if (inserted.error.code === "23505") {
+        const { data: existing } = await db
+          .from("room_memberships")
+          .select("id, role")
+          .eq("room_code", code)
+          .eq("auth_user_id", userId)
+          .maybeSingle()
+          .returns<MembershipRow>();
+
+        return NextResponse.json({
+          joined: true,
+          role: existing?.role ?? "member",
+        });
+      }
+
+      throw inserted.error;
+    }
+
+    if (role === "owner" && inserted.data) {
+      await db
+        .from("studio_rooms")
+        .update({ owner_member_id: inserted.data.id })
+        .eq("code", code)
+        .is("owner_member_id", null);
+    }
+
+    return NextResponse.json({
+      joined: true,
+      role: inserted.data?.role ?? role,
+    });
   } catch (error) {
     console.error("Join room:", error);
     return NextResponse.json(
