@@ -9,6 +9,7 @@ import {
   ArrowRight,
   Zap,
 } from "lucide-react";
+import { createBrowserClient } from "@/lib/supabase-browser";
 
 export default function Home() {
   const router = useRouter();
@@ -21,8 +22,23 @@ export default function Home() {
     setError("");
 
     try {
+      const supabase = createBrowserClient();
+      const existing = (await supabase.auth.getSession()).data.session;
+
+      if (!existing) {
+        const { error: signInError } =
+          await supabase.auth.signInAnonymously();
+
+        if (signInError) throw new Error("Sign-in failed");
+      }
+
+      const session = (await supabase.auth.getSession()).data.session;
+
       const response = await fetch("/api/rooms", {
         method: "POST",
+        headers: session?.access_token
+          ? { "x-supabase-auth": session.access_token }
+          : {},
       });
 
       const result = await response.json();
@@ -31,7 +47,9 @@ export default function Home() {
         throw new Error(result.error || "Unable to create room");
       }
 
-      router.push(`/room/${result.room.code}`);
+      router.push(
+        `/room/${result.room.code}#access_token=${result.accessToken}`
+      );
     } catch (err) {
       setError(
         err instanceof Error ? err.message : "Unknown error"

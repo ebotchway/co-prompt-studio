@@ -23,3 +23,13 @@ export type RoomEdit = {
   field: EditableField;
   value: string | number;
 };
+
+export type RoomRun = {
+  id: string;
+  snapshot_hash: string;
+  model: string;
+  temperature: number;
+  status: string;
+  error: string | null;
+  executed_at: string;
+};

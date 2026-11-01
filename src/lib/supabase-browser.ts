@@ -1,14 +1,30 @@
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-export function createBrowserClient() {
-  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+declare global {
+  var __copromptSupabaseBrowserClient: SupabaseClient | undefined;
+}
 
-  if (!url || !key) {
-    throw new Error("Missing Supabase browser configuration");
+export function createBrowserClient(): SupabaseClient {
+  if (typeof window === "undefined") {
+    throw new Error("createBrowserClient is browser-only");
   }
 
-  return createClient(url, key, {
-    auth: { persistSession: false },
-  });
+  if (!globalThis.__copromptSupabaseBrowserClient) {
+    const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+    if (!url || !key) {
+      throw new Error("Missing Supabase browser configuration");
+    }
+
+    globalThis.__copromptSupabaseBrowserClient = createClient(url, key, {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: true,
+      },
+    });
+  }
+
+  return globalThis.__copromptSupabaseBrowserClient;
 }
