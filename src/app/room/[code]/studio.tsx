@@ -10,6 +10,7 @@ import {
   LoaderCircle, Users, Wifi, WifiOff,
 } from "lucide-react";
 import { createBrowserClient } from "@/lib/supabase-browser";
+import { RoomRealtimeController } from "@/lib/realtime/room-realtime";
 import type {
   EditableField, RoomEdit, RoomRun, StudioRoom,
 } from "@/lib/room-types";
@@ -188,10 +189,63 @@ export default function Studio({ code }: { code: string }) {
     client.current = supabase;
     identity.current = `Guest-${crypto.randomUUID().slice(0, 6)}`;
 
-    let disposed = false;
-    let attempts = 0;
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
-    let roomChannel: RealtimeChannel | null = null;
+    const controller = new RoomRealtimeController({
+      supabase,
+      code,
+      callbacks: {
+        onConnectionChange: setConnected,
+        onPresenceCount: setOnline,
+        onMembershipDenied: () => setNeedsInvite(true),
+        onSubscribed: (active) => {
+          channel.current = active;
+        },
+        onResultsUpdated: () => void loadRoom(),
+        onJoinedRoom: () => void loadRoom(),
+        presenceKey: () => identity.current,
+        onEdit: (edit) => {
+          if (edit.sender === identity.current) return;
+
+          // Do not overwrite a textarea being edited locally.
+          if (focused.current !== edit.field) {
+            setRoom((current) => {
+              if (!current) return current;
+              const next = { ...current, [edit.field]: edit.value };
+              latest.current = next;
+              return next;
+            });
+          }
+
+          setTyping(`${edit.sender} is editing`);
+        },
+      },
+      getSessionToken: async () =>
+        (await ensureSignedIn())?.access_token ?? null,
+      joinRoom: async () => {
+        const session = await ensureSignedIn();
+
+        const response = await fetch(`/api/rooms/${code}/join`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            ...(session?.access_token
+              ? { "x-supabase-auth": session.access_token }
+              : {}),
+          },
+        });
+
+        return { ok: response.ok, status: response.status };
+      },
+      probeMembership: async () => {
+        const response = await fetch(`/api/rooms/${code}`, {
+          cache: "no-store",
+          headers: await authHeaders(),
+        });
+
+        return response.status;
+      },
+    });
+
+    teardownRef.current = () => void controller.stop();
 
     // Re-authorize the socket on every auth event: refreshed tokens keep
     // long sessions subscribed, and the token re-check after a membership
@@ -199,200 +253,20 @@ export default function Studio({ code }: { code: string }) {
     const { data: authListener } = supabase.auth.onAuthStateChange(
       (event, session) => {
         if (
-          !disposed &&
           (event === "TOKEN_REFRESHED" || event === "SIGNED_IN") &&
           session?.access_token
         ) {
-          void supabase.realtime.setAuth(session.access_token);
+          void controller.setAuth(session.access_token);
         }
       }
     );
 
-    const teardownChannel = () => {
-      if (retryTimer) {
-        clearTimeout(retryTimer);
-        retryTimer = null;
-      }
-
-      if (roomChannel) {
-        void supabase.removeChannel(roomChannel);
-        roomChannel = null;
-      }
-
-      if (channel.current) channel.current = null;
-      setConnected(false);
-    };
-
-    teardownRef.current = teardownChannel;
-
-    // Realtime authorizes channels only at join, so a revoked member's
-    // open socket keeps delivering until it is left client-side. Probe
-    // the membership-gated API periodically and close the channel on 403.
-    const membershipProbe = setInterval(() => {
-      if (disposed) return;
-
-      void (async () => {
-        try {
-          const probe = await fetch(`/api/rooms/${code}`, {
-            cache: "no-store",
-            headers: await authHeaders(),
-          });
-
-          if (disposed) return;
-
-          if (probe.status === 401 || probe.status === 403) {
-            teardownChannel();
-            setNeedsInvite(true);
-          }
-        } catch {
-          // Network hiccups are handled by the subscribe retry path.
-        }
-      })();
-    }, 45000);
-
-    const subscribeChannel = async () => {
-      const session = await ensureSignedIn();
-
-      if (disposed || !session?.access_token) {
-        if (!disposed) {
-          setConnected(false);
-          retryTimer = setTimeout(() => void subscribeChannel(), 2000);
-        }
-        return;
-      }
-
-      const joinResponse = await fetch(`/api/rooms/${code}/join`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "x-supabase-auth": session.access_token,
-        },
-      });
-
-      if (disposed) return;
-
-      if (!joinResponse.ok) {
-        if (joinResponse.status === 401 || joinResponse.status === 403) {
-          setNeedsInvite(true);
-        }
-
-        setConnected(false);
-        return;
-      }
-
-      // Private channels verify a fresh JWT server-side; an expired or
-      // missing session would be rejected at subscribe time.
-      await supabase.realtime.setAuth(session.access_token);
-
-      if (disposed) return;
-
-      roomChannel = supabase.channel(`coprompt-room-${code}`, {
-        config: {
-          private: true,
-          presence: { key: identity.current },
-        },
-      });
-
-      roomChannel.on("broadcast", { event: "edit" }, ({ payload }) => {
-        const edit = payload as RoomEdit;
-        if (edit.sender === identity.current) return;
-
-        // Do not overwrite a textarea being edited locally.
-        if (focused.current !== edit.field) {
-          setRoom((current) => {
-            if (!current) return current;
-            const next = { ...current, [edit.field]: edit.value };
-            latest.current = next;
-            return next;
-          });
-        }
-
-        setTyping(`${edit.sender} is editing`);
-      });
-
-      roomChannel.on("broadcast", { event: "results-updated" }, () => {
-        void loadRoom();
-      });
-
-      roomChannel.on("presence", { event: "sync" }, () => {
-        setOnline(Object.keys(roomChannel!.presenceState()).length);
-      });
-
-      roomChannel.subscribe(async (status) => {
-        if (disposed) return;
-
-        if (status === "SUBSCRIBED") {
-          attempts = 0;
-          setConnected(true);
-
-          await roomChannel?.track({
-            name: identity.current,
-            joined_at: new Date().toISOString(),
-          });
-
-          // Catch updates saved before this browser joined.
-          void loadRoom();
-        } else {
-          setConnected(false);
-
-          if (
-            status === "CHANNEL_ERROR" ||
-            status === "TIMED_OUT" ||
-            status === "CLOSED"
-          ) {
-            if (roomChannel) {
-              void supabase.removeChannel(roomChannel);
-              roomChannel = null;
-              channel.current = null;
-            }
-
-            attempts += 1;
-
-            const delay = Math.min(30000, 1000 * 2 ** (attempts - 1));
-
-            retryTimer = setTimeout(() => void subscribeChannel(), delay);
-
-            // Repeated failures are usually a lost socket, but they are
-            // also what membership denial looks like. After a few tries,
-            // ask the API instead of retrying forever.
-            if (attempts >= 3) {
-              const probe = await fetch(`/api/rooms/${code}`, {
-                cache: "no-store",
-                headers: await authHeaders(),
-              });
-
-              if (disposed) return;
-
-              if (probe.status === 403 || probe.status === 401) {
-                teardownChannel();
-                setNeedsInvite(true);
-              }
-            }
-          }
-        }
-      });
-
-      channel.current = roomChannel;
-    };
-
-    void subscribeChannel();
+    controller.start();
 
     return () => {
-      disposed = true;
-
       authListener.subscription.unsubscribe();
-
-      clearInterval(membershipProbe);
       teardownRef.current = null;
-
-      if (retryTimer) clearTimeout(retryTimer);
-
-      setConnected(false);
-
-      if (roomChannel) {
-        void supabase.removeChannel(roomChannel);
-      }
-
+      void controller.stop();
       channel.current = null;
       client.current = null;
     };
